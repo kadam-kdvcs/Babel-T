@@ -1,0 +1,6 @@
+# 项目依赖（阶段 1 最小集）
+# streamlit：网页界面框架
+# pytest：单元测试
+# 注意：本阶段不 import pandas；后续阶段按需追加依赖
+streamlit>=1.41
+pytest>=8.0
