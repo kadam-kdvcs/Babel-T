@@ -128,11 +128,25 @@ def render_results(results: dict) -> None:
         zip(results["paragraphs"], results["translations"]), start=1
     ):
         st.markdown(f"**第 {i} 段（阿语）**")
-        # html.escape：转义用户文本中的 < > & 等字符，防止破坏页面（注入防护）
-        # str.replace：段内换行 \n 转成 <br>，markdown 单换行不渲染，需要手动转
+        # ---- 下面这行同时涉及 HTML 转义与换行处理，说明如下 ----
+        # html.escape(paragraph)：把用户文本里的 < > & 等特殊字符转成安全写法
+        #   （如 < 变成 &lt;）。原因：这些字符如果原样进入页面，会被浏览器当成
+        #   网页代码执行——用户故意输入 <script> 就能注入脚本，这叫「注入攻击」。
+        #   escape 之后它们只会被当作普通文字显示，页面结构不受用户输入影响。
+        # .replace("\n", "<br>")：把段落内部的换行符换成 <br> 标签。
+        #   <br> 是 HTML 里的「换行」标签（break line 的缩写，写成 <br> 即换行）；
+        #   浏览器默认会把连续空白（含换行）压缩成一个空格，
+        #   所以不转成 <br> 的话，段内换行显示时会消失，整段挤成一行。
         safe_paragraph = html.escape(paragraph).replace("\n", "<br>")
+        # <div> 是 HTML 的「分区」标签，表示一块独立的区域；
+        # class="ar-para" 给这块区域贴上名为 ar-para 的类标签，
+        # 于是上面 <style> 里的 .ar-para 规则就会只作用于这个元素（阿语区）。
+        # 注意顺序：必须先 escape 消毒、再套 <div> 标签，
+        # 保证用户输入里的尖括号不会破坏 div 标签本身的结构。
         st.markdown(f'<div class="ar-para">{safe_paragraph}</div>', unsafe_allow_html=True)
         st.markdown(f"**第 {i} 段（译文·占位）**")
+        # 译文区同理：div 标签 + zh-trans 类名，套用上面定义的灰色样式；
+        # 译文是我们自己的程序文本（无用户输入），仍 escape 一次做统一防护。
         st.markdown(f'<div class="zh-trans">{html.escape(translation)}</div>', unsafe_allow_html=True)
         st.divider()
 
@@ -164,21 +178,38 @@ st.set_page_config(page_title="阿语审校助手 MVP", layout="wide")
 st.title("阿拉伯语翻译审校助手（MVP）")
 st.caption("第 1 阶段：纯本地流水线。译文与审校报告为占位内容，后续阶段接入翻译 API 与 LLM。")
 
-# 注入 RTL 样式：只作用于标有 ar-para 类的阿语容器，不影响页面其他部分
-# （direction: rtl 让阿语从右往左排；unicode-bidi: embed 处理中阿混排的字符顺序）
+# ---- 注入自定义样式（HTML + CSS 知识，供初学者参考）----
+# 先补充背景：网页的内容结构用「HTML 标签」标记（如 <div> 表示一块区域、
+# <br> 表示换行），外观（颜色、字体、对齐等）由「CSS 规则」控制。
+# 比喻：HTML 是骨架，CSS 是皮肤。下面要写的就是一段 CSS。
+#
+# st.markdown 默认只解析 Markdown 语法；我们想塞入原生 HTML/CSS，
+# 所以加参数 unsafe_allow_html=True，告诉 Streamlit「这个字符串里有 HTML，
+# 请把它当作网页代码渲染，而不是当成普通文字显示」。
+# 参数名里的 unsafe 是在提醒：信任字符串里的 HTML 有安全风险（注入攻击），
+# 因此本文件中所有用户输入的文本，都必须先经 html.escape 消毒（见下方渲染处）。
 st.markdown(
     """
     <style>
+    /* 下面是一个 CSS 规则。CSS 规则 = 选择器 + 声明块。
+       选择器 .ar-para 表示「页面上所有 class（类名）为 ar-para 的元素」；
+       开头的小数点 . 就是「按类名选元素」的固定写法。
+       大括号里的每一条都是「属性名: 值;」，用于控制这些元素的外观。 */
     .ar-para {
-        direction: rtl;
-        unicode-bidi: embed;
-        text-align: right;
-        font-size: 1.1rem;
-        line-height: 2;
+        direction: rtl;    /* 文字书写方向：rtl = right-to-left，从右往左排（阿语习惯） */
+        unicode-bidi: embed;  /* 双向文本算法：中阿混排时按内容自身方向处理字符顺序，
+                                 避免阿拉伯语里的数字/英文标点被浏览器排反 */
+        text-align: right;    /* 段落整体右对齐，与从右往左的书写方向配套 */
+        font-size: 1.1rem;    /* 字号：1rem = 浏览器默认字号（约 16px），1.1 倍略大一点 */
+        line-height: 2;       /* 行高为字号的 2 倍：行距留宽，阿语的上下变音符不被挤压 */
         font-family: "Segoe UI", "Noto Naskh Arabic", "Traditional Arabic", sans-serif;
+        /* 字体优先级列表：浏览器从左往右找，第一个「本机已安装」的字体生效；
+           前两个是常见阿语文档字体（Noto Naskh Arabic 为开源阿语字体），
+           最后的 sans-serif 是兜底（无衬线通用字体，任何系统都有） */
     }
+    /* 译文区的样式：只改文字颜色，让译文与阿语原文有视觉区分 */
     .zh-trans {
-        color: #666;
+        color: #666;  /* 文字颜色：#666 是十六进制色值，表示中等灰色 */
     }
     </style>
     """,
