@@ -6,8 +6,8 @@
 
 ## 技术栈与约束（不可擅自更改）
 
-- Python 3.13 + Streamlit + 标准库 csv（**不 import pandas**）
-- 暂不接翻译 API / LLM / SQLite（分别在第 2/3/4 阶段引入）
+- Python 3.13 + Streamlit + 标准库 csv（**不 import pandas**）+ requests + python-dotenv
+- 阶段 2 已接翻译 API：阿里云机器翻译（TranslateGeneral，RPC 手写 HMAC-SHA1 签名，双模式 mock/api）；暂不接 LLM / SQLite（第 3/4 阶段引入）
 - 不用 React/Vue/FastAPI/Django/Flask/Dify；不做登录权限、部署、PDF/Word
 - API Key 绝不写入代码；需要时用 .env / 环境变量 + .env.example
 - 所有路径相对路径；所有 open() 显式 encoding="utf-8" / "utf-8-sig"；CSV 必须 newline=""
@@ -26,7 +26,9 @@ modules/ 不是包（无 __init__.py），依赖「从根目录运行」把 cwd 
 
 ```
 app.py                      # 唯一 UI 入口（Streamlit）
-modules/                    # 纯函数模块：segmenter / glossary / translator / reviewer / storage
+.env.example                # 环境变量模板（只含占位说明，Key 留空）
+.env                        # 本地真实密钥（gitignored，绝不提交）
+modules/                    # 纯函数模块：segmenter / glossary / settings / translator / reviewer / storage
 data/                       # terms.csv（六列）、proper_names.csv（四列）、samples/
 tests/                      # pytest 测试
 prompts/review_report_prompt.md   # LLM 审校提示词模板（阶段 3 启用）
@@ -48,6 +50,8 @@ docs/                       # meeting_notes.md 决策记录、modules.md 模块�
 - **段落切分**：有空行按空行分段；无空行按换行分段（每行一段）
 - **RTL 显示**：阿语用 CSS class `.ar-para`（direction: rtl），只影响阿语区域；用户文本先 html.escape 再拼 HTML
 - **session_state**：只用 1 个键 "results" 存结果，防止按钮后重跑丢失
+- **翻译双模式（阶段 2）**：环境变量 `TRANSLATION_ENGINE` = mock（占位，默认）/ api（调阿里云）；api 缺密钥自动回退占位 + 页面黄色提示，不报错；逐段串行、一段失败中断整批（异常带段号）；术语/专名约束 `build_translation_constraints` **生成但不发送**（阿里云 TranslateGeneral 无 context 参数，payload 留 `params["Context"]` 注释位）；dotenv 只在 app.py 顶部加载一次，modules/ 不 import dotenv
+- **配置集中管理（阶段 2 重构）**：翻译配置（环境变量名 `ENV_*` / 默认值 `DEFAULT_*` / 引擎标识 / `TranslationConfig` / `load_translation_config`）集中在 `modules/settings.py`，`translator.py` 只保留翻译逻辑；引用方**显式从正确模块导入**——配置符号从 settings 取，翻译符号（`translate_paragraphs` / `TranslationError` 家族）从 translator 取（异常刻意留 translator：错误是翻译行为的对外契约）；改配置只动 settings.py；环境变量值 strip、空串=未设置=默认值
 
 ## 开发规则（团队约定，必须遵守）
 
@@ -58,6 +62,11 @@ docs/                       # meeting_notes.md 决策记录、modules.md 模块�
 5. 需求不清楚先向用户提问，不擅自改技术路线
 6. 分阶段目标参见 README.md「路线图」
 
-## 当前阶段（第 1 阶段）已确认的决策
+## 当前阶段（第 2 阶段）已确认的决策
 
-见 docs/meeting_notes.md（决策日志）。阶段 1 已全部完成：本地流水线 + 测试 + 文档。
+- 翻译引擎：requests 手写阿里云 RPC 签名（不引 SDK）；mock/api 双模式由环境变量切换
+- 缺 key 回退占位（页面黄色提示），不崩溃；翻译失败（网络/业务/解析）中断整批并显示错误，旧结果保留
+- 术语约束生成但不发送（阿里云该 API 无 context 参数）；DeepSeek key 仅 .env 预留（阶段 3 启用）
+- 安全：真实密钥仅放本地 .env（gitignored），绝不进代码/README/测试/日志
+
+阶段 1/2 已全部完成（本地流水线 + 双模式翻译 + 73 测试 + 文档）。详细决策见 docs/meeting_notes.md。

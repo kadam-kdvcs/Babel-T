@@ -1,24 +1,36 @@
 # 阿拉伯语翻译审校助手（MVP）
 
-面向**阿语政治外交 / 国际传播文本**的翻译审校辅助原型。用户粘贴一段阿语文本，系统切分段落、扫描术语库与专名库、生成占位译文与占位审校报告，为后续接入翻译 API 与 LLM 审校打好框架。
+面向**阿语政治外交 / 国际传播文本**的翻译审校辅助原型。用户粘贴一段阿语文本，系统切分段落、扫描术语库与专名库、生成译文（可接入阿里云机器翻译）与占位审校报告，为后续接入 LLM 审校打好框架。
 
-## 当前阶段（第 1 阶段）
+## 当前阶段（第 2 阶段）
 
-本阶段只做**纯本地流水线**，不接任何外部服务：
+本阶段在阶段 1 纯本地流水线之上接入**真实翻译 API**（阿里云机器翻译，双模式）：
 
 - 按段落切分文本（有空行按空行分段；无空行按换行分段）
 - 扫描术语库 `data/terms.csv` 与专名库 `data/proper_names.csv`
 - 阿语归一化（去变音符、去 tatweel、去 bidi 控制符、统一 أإآٱ→ا）后纯子串匹配
-- 显示：阿中双语对照、术语命中表、专名命中表、占位译文、占位审校报告
+- **翻译双模式**：默认 `mock`（占位译文，不联网）；配置密钥后走 `api`（阿里云真实翻译，逐段串行）
+- 显示：阿中双语对照、术语命中表、专名命中表、译文、占位审校报告
 
-**本阶段明确不做**：真实翻译 API、LLM 审校、SQLite 存储、登录权限、部署、PDF/Word、词边界判断（纯子串会命中派生词，如「فلسطين」会命中「الفلسطينية」，属已知取舍，后续阶段再加边界规则）。
+**双模式说明**：
+
+| 模式 | 行为 | 何时用 |
+|---|---|---|
+| `mock`（默认） | 不联网，返回「（占位译文·第N段）待接入翻译 API」 | 开发调试、无密钥环境 |
+| `api` | 调用阿里云机器翻译，返回真实译文 | 真实使用 |
+
+模式由环境变量 `TRANSLATION_ENGINE` 控制（`mock` / `api`）。**api 模式未配置密钥时自动回退占位译文并在页面黄色提示**，不会报错崩溃；翻译失败（网络/业务/解析错误）页面显示错误、保留上次成功结果。
+
+**本阶段明确不做**：LLM 审校、SQLite 存储、登录权限、部署、PDF/Word、词边界判断（纯子串会命中派生词，如「فلسطين」会命中「الفلسطينية」，属已知取舍）、术语约束发送给阿里云（该 API 无 context 参数，约束文本仅生成，供阶段 3 LLM 使用）。
 
 ## 目录结构
 
 ```
 arabic-review-mvp/
 ├── app.py                      # Streamlit 页面（唯一 UI 入口）
-├── requirements.txt
+├── requirements.txt            # streamlit / pytest / requests / python-dotenv
+├── .env.example                # 环境变量模板（Key 留空，供复制为 .env）
+├── .env                        # 本地真实密钥（gitignored，绝不提交）
 ├── CLAUDE.md                   # 给后续 Claude 会话的项目说明
 ├── data/
 │   ├── terms.csv               # 术语库（六列，见下）
@@ -27,14 +39,15 @@ arabic-review-mvp/
 ├── modules/                    # 纯函数模块（不含 UI）
 │   ├── segmenter.py            # 段落切分
 │   ├── glossary.py             # 归一化 / CSV 加载 / 命中扫描
-│   ├── translator.py           # 占位译文（阶段 2 接 API）
+│   ├── translator.py           # 翻译双模式：mock 占位 / api 阿里云真实翻译
 │   ├── reviewer.py             # 占位报告（阶段 3 接 LLM）
 │   └── storage.py              # 占位（阶段 4 接 SQLite）
 ├── prompts/
 │   └── review_report_prompt.md # LLM 审校提示词模板（阶段 3 启用）
 ├── docs/
 │   ├── meeting_notes.md        # 开发决策记录
-│   └── modules.md              # 模块功能说明（供审查）
+│   ├── modules.md              # 模块功能说明（供审查）
+│   └── stage2_plan.md          # 阶段 2 实施计划（已批准）
 └── tests/                      # pytest 单元测试
 ```
 
@@ -48,11 +61,19 @@ py -m venv .venv
 # 2. 安装依赖
 pip install -r requirements.txt
 
-# 3. 启动页面（必须在项目根目录运行）
+# 3. （可选）配置真实翻译：复制 .env.example 为 .env，填入阿里云 AccessKey
+copy .env.example .env
+#    然后编辑 .env：TRANSLATION_ENGINE=api + 填入 ALIYUN_ACCESS_KEY_ID/SECRET。
+#    不配置也能跑：默认 mock 模式（占位译文，不联网）。
+#    .env 已被 .gitignore 忽略，密钥绝不提交 git。
+
+# 4. 启动页面（必须在项目根目录运行）
 streamlit run app.py
 ```
 
 打开浏览器进入页面后，输入框已预填示例文本，直接点「开始翻译与审校」即可看到效果。
+
+**命令行直接调用流水线**（不启动页面）：`python -c "from app import run_pipeline; print(run_pipeline('文本')['translations'])"`（需在项目根目录；命令行环境同样会读取 .env 密钥）。
 
 ## 运行测试
 
@@ -91,9 +112,9 @@ python -m pytest -v
 
 ## 路线图
 
-- **阶段 1（当前）**：可运行页面 + 本地流水线 + 单测 + 文档
-- **阶段 2**：接入真实翻译 API（届时新增 `.env.example`，Key 走环境变量，绝不写入代码）
-- **阶段 3**：LLM 生成审校报告（使用 prompts/review_report_prompt.md 模板）
+- **阶段 1（已完成）**：可运行页面 + 本地流水线 + 单测 + 文档
+- **阶段 2（当前）**：接入真实翻译 API（阿里云机器翻译，双模式 mock/api，Key 走 `.env` 环境变量，绝不写入代码）
+- **阶段 3**：LLM 生成审校报告（使用 prompts/review_report_prompt.md 模板；DeepSeek key 已在 .env 预留）
 - **阶段 4**：SQLite 保存审校记录，老师审校意见输入与保存
 
 ## 开发规则（团队约定）
