@@ -1,10 +1,14 @@
-"""Streamlit 页面入口（第 1 阶段）：阿拉伯语翻译审校助手 MVP。
+"""Streamlit 页面入口（第 2 阶段）：阿拉伯语翻译审校助手 MVP。
 
 页面布局：
 1. 标题与说明
 2. 阿语文本输入框（预填示例文本）
 3. 「开始翻译与审校」按钮
 4. 五个展示区：双语对照 / 术语命中 / 专名命中 / 审校报告
+
+翻译双模式（阶段 2）：默认 mock（占位译文，不联网）；配置阿里云
+密钥后走 api（真实翻译）。api 缺密钥时自动回退占位译文并提示，
+任一翻译异常时页面提示错误、保留上次成功结果。
 
 本文件是唯一包含 UI 的模块；流水线逻辑集中在 run_pipeline()，
 不依赖页面状态，可在命令行直接调用验证。
@@ -15,11 +19,27 @@ from pathlib import Path  # 标准库：跨平台路径处理
 
 import streamlit as st  # 页面框架：所有界面控件都来自这里
 
-# 业务模块：段落切分 / 词库扫描 / 占位翻译 / 占位报告
-from modules import glossary, reviewer, segmenter, translator
+# python-dotenv：把项目根目录 .env 文件里的键值对加载进环境变量。
+# 原因：翻译 API 的密钥（AccessKey 等）绝不能写死在代码里，而是由用户
+# 填写在 .env 文件中（该文件已被 .gitignore 忽略，绝不会提交 git），
+# 程序启动时用 load_dotenv 把密钥读进环境变量，供 translator 模块读取。
+# 注意：只有 app.py 在这里加载 .env；modules/ 下不 import dotenv，
+# 保证翻译模块在测试中只依赖注入的环境变量（可测试性）。
+from dotenv import load_dotenv
+
+# 业务模块：段落切分 / 词库扫描 / 翻译（双模式）/ 占位报告；
+# settings 是翻译配置中心（环境变量名/默认值/配置加载），
+# 配置符号从这里取，翻译符号（translate_paragraphs、异常）从 translator 取
+from modules import glossary, reviewer, segmenter, settings, translator
 
 # 项目根目录：本文件所在目录（无论从哪个目录启动 streamlit 都有效）
 BASE_DIR = Path(__file__).parent
+
+# load_dotenv(BASE_DIR / ".env")：显式指定 .env 的路径为「项目根目录」，
+# 保证无论从哪个目录启动 streamlit（哪怕从别的目录敲命令），
+# 都能找到 .env 文件并读取其中的密钥配置。
+# 该加载在 app.py 顶部执行一次，之后各模块读取 os.environ 即可。
+load_dotenv(BASE_DIR / ".env")
 
 # 处理方式代码 → 中文显示标签（仅展示用，不改动 CSV 里存的值）
 _CHECK_LABELS = {
@@ -49,18 +69,24 @@ def _load_sample() -> str:
 
 
 def run_pipeline(text: str) -> dict:
-    """执行完整处理流水线（纯本地，无任何 API 调用）。
+    """执行完整处理流水线（切分 → 扫描 → 翻译 → 报告）。
 
-    作用：把输入的阿语文本依次送过「切分 → 加载词库 → 扫描 → 占位译文 → 占位报告」，
+    作用：把输入的阿语文本依次送过「切分 → 加载词库 → 扫描 → 翻译 → 报告」，
           返回结果字典供页面渲染；也支持命令行直接调用验证。
+          翻译模式由环境变量决定（mock 占位 / api 真实翻译），
+          是否回退占位通过返回键 translation_fallback 告知页面。
     输入：text —— 用户输入的整篇阿语文本。
     输出：dict —— 键：
-          paragraphs   阿语段落列表
-          translations 占位译文列表
-          term_hits    术语命中列表
-          name_hits    专名命中列表
-          report       占位审校报告字符串
-    异常：数据文件缺失时抛出 FileNotFoundError（由 UI 层转成提示）。
+          paragraphs           阿语段落列表
+          translations         译文列表（占位或真实翻译）
+          term_hits            术语命中列表
+          name_hits            专名命中列表
+          report               占位审校报告字符串
+          translation_mode     "mock" 或 "api"（本次生效的翻译模式）
+          translation_fallback True 表示「api 模式但缺密钥，本次用了占位译文」
+    异常：数据文件缺失时抛出 FileNotFoundError；翻译失败抛
+          translator.TranslationError 家族；环境变量非法抛 ValueError
+          （全部由 UI 层转成页面提示）。
     """
     # 段落切分：整篇文本 → 段落列表
     paragraphs = segmenter.segment_paragraphs(text)
@@ -73,8 +99,20 @@ def run_pipeline(text: str) -> dict:
     term_hits = glossary.scan_glossary(paragraphs, terms)
     name_hits = glossary.scan_glossary(paragraphs, names)
 
-    # 占位译文与占位审校报告（后续阶段分别替换为 API 与 LLM 实现）
-    translations = translator.translate_paragraphs(paragraphs)
+    # 翻译：mock 模式生成占位译文，api 模式调用阿里云真实翻译；
+    # 传入术语/专名命中，供构建每段的术语约束文本（阶段 3 接 LLM 用）
+    translations = translator.translate_paragraphs(paragraphs, term_hits, name_hits)
+
+    # 读取本次生效的翻译配置，确定「模式」与「是否回退占位」两个展示键。
+    # 页面直接读这两个键渲染提示，不在 UI 层重复推断配置逻辑；
+    # 环境变量非法时这里（以及 translate_paragraphs 内部）会抛 ValueError。
+    config = settings.load_translation_config()
+    translation_mode = config.engine
+    translation_fallback = (
+        config.engine == settings.API_ENGINE and not config.has_credentials
+    )
+
+    # 占位审校报告（阶段 3 接入 LLM 后替换）
     report = reviewer.generate_review_report(paragraphs, translations, term_hits, name_hits)
 
     return {
@@ -83,6 +121,8 @@ def run_pipeline(text: str) -> dict:
         "term_hits": term_hits,
         "name_hits": name_hits,
         "report": report,
+        "translation_mode": translation_mode,
+        "translation_fallback": translation_fallback,
     }
 
 
@@ -122,17 +162,45 @@ def render_results(results: dict) -> None:
     输入：results —— run_pipeline 的输出 dict。
     输出：无（直接向页面输出控件）。
     """
+    # 回退提示：配置了 api 模式但没配密钥（run_pipeline 已判定回退），
+    # 本次译文是占位内容。提示放在结果区顶部，让用户第一眼看到，
+    # 而不是在每段译文旁边重复解释。
+    if results.get("translation_fallback"):
+        st.warning("已配置 API 模式但未配置密钥，本次使用占位译文。")
+
     st.subheader("双语对照")
     # zip：把段落与译文一一配对；enumerate：从 1 开始编号段落
     for i, (paragraph, translation) in enumerate(
         zip(results["paragraphs"], results["translations"]), start=1
     ):
         st.markdown(f"**第 {i} 段（阿语）**")
-        # html.escape：转义用户文本中的 < > & 等字符，防止破坏页面（注入防护）
-        # str.replace：段内换行 \n 转成 <br>，markdown 单换行不渲染，需要手动转
+        # ---- 下面这行同时涉及 HTML 转义与换行处理，说明如下 ----
+        # html.escape(paragraph)：把用户文本里的 < > & 等特殊字符转成安全写法
+        #   （如 < 变成 &lt;）。原因：这些字符如果原样进入页面，会被浏览器当成
+        #   网页代码执行——用户故意输入 <script> 就能注入脚本，这叫「注入攻击」。
+        #   escape 之后它们只会被当作普通文字显示，页面结构不受用户输入影响。
+        # .replace("\n", "<br>")：把段落内部的换行符换成 <br> 标签。
+        #   <br> 是 HTML 里的「换行」标签（break line 的缩写，写成 <br> 即换行）；
+        #   浏览器默认会把连续空白（含换行）压缩成一个空格，
+        #   所以不转成 <br> 的话，段内换行显示时会消失，整段挤成一行。
         safe_paragraph = html.escape(paragraph).replace("\n", "<br>")
+        # <div> 是 HTML 的「分区」标签，表示一块独立的区域；
+        # class="ar-para" 给这块区域贴上名为 ar-para 的类标签，
+        # 于是上面 <style> 里的 .ar-para 规则就会只作用于这个元素（阿语区）。
+        # 注意顺序：必须先 escape 消毒、再套 <div> 标签，
+        # 保证用户输入里的尖括号不会破坏 div 标签本身的结构。
         st.markdown(f'<div class="ar-para">{safe_paragraph}</div>', unsafe_allow_html=True)
-        st.markdown(f"**第 {i} 段（译文·占位）**")
+        # 译文标签随翻译模式变化：api 模式且未回退 → 真实译文，标签不带
+        # 「占位」字样；mock 模式或回退占位 → 带「占位」，提醒用户该译文
+        # 未经真实翻译，仅用于演示数据流。
+        if results.get("translation_mode") == settings.API_ENGINE and not results.get(
+            "translation_fallback"
+        ):
+            st.markdown(f"**第 {i} 段（译文）**")
+        else:
+            st.markdown(f"**第 {i} 段（译文·占位）**")
+        # 译文区同理：div 标签 + zh-trans 类名，套用上面定义的灰色样式；
+        # 译文是我们自己的程序文本（无用户输入），仍 escape 一次做统一防护。
         st.markdown(f'<div class="zh-trans">{html.escape(translation)}</div>', unsafe_allow_html=True)
         st.divider()
 
@@ -162,23 +230,44 @@ st.set_page_config(page_title="阿语审校助手 MVP", layout="wide")
 
 # st.title：页面大标题；st.caption：标题下的灰色说明文字
 st.title("阿拉伯语翻译审校助手（MVP）")
-st.caption("第 1 阶段：纯本地流水线。译文与审校报告为占位内容，后续阶段接入翻译 API 与 LLM。")
+st.caption(
+    "第 2 阶段：翻译支持双模式——默认 mock（占位译文，不联网）；"
+    "配置阿里云密钥后走 api 真实翻译，缺密钥时自动回退占位译文并提示。"
+    "审校报告仍为占位内容（第 3 阶段接入 LLM）。"
+)
 
-# 注入 RTL 样式：只作用于标有 ar-para 类的阿语容器，不影响页面其他部分
-# （direction: rtl 让阿语从右往左排；unicode-bidi: embed 处理中阿混排的字符顺序）
+# ---- 注入自定义样式（HTML + CSS 知识，供初学者参考）----
+# 先补充背景：网页的内容结构用「HTML 标签」标记（如 <div> 表示一块区域、
+# <br> 表示换行），外观（颜色、字体、对齐等）由「CSS 规则」控制。
+# 比喻：HTML 是骨架，CSS 是皮肤。下面要写的就是一段 CSS。
+#
+# st.markdown 默认只解析 Markdown 语法；我们想塞入原生 HTML/CSS，
+# 所以加参数 unsafe_allow_html=True，告诉 Streamlit「这个字符串里有 HTML，
+# 请把它当作网页代码渲染，而不是当成普通文字显示」。
+# 参数名里的 unsafe 是在提醒：信任字符串里的 HTML 有安全风险（注入攻击），
+# 因此本文件中所有用户输入的文本，都必须先经 html.escape 消毒（见下方渲染处）。
 st.markdown(
     """
     <style>
+    /* 下面是一个 CSS 规则。CSS 规则 = 选择器 + 声明块。
+       选择器 .ar-para 表示「页面上所有 class（类名）为 ar-para 的元素」；
+       开头的小数点 . 就是「按类名选元素」的固定写法。
+       大括号里的每一条都是「属性名: 值;」，用于控制这些元素的外观。 */
     .ar-para {
-        direction: rtl;
-        unicode-bidi: embed;
-        text-align: right;
-        font-size: 1.1rem;
-        line-height: 2;
+        direction: rtl;    /* 文字书写方向：rtl = right-to-left，从右往左排（阿语习惯） */
+        unicode-bidi: embed;  /* 双向文本算法：中阿混排时按内容自身方向处理字符顺序，
+                                 避免阿拉伯语里的数字/英文标点被浏览器排反 */
+        text-align: right;    /* 段落整体右对齐，与从右往左的书写方向配套 */
+        font-size: 1.1rem;    /* 字号：1rem = 浏览器默认字号（约 16px），1.1 倍略大一点 */
+        line-height: 2;       /* 行高为字号的 2 倍：行距留宽，阿语的上下变音符不被挤压 */
         font-family: "Segoe UI", "Noto Naskh Arabic", "Traditional Arabic", sans-serif;
+        /* 字体优先级列表：浏览器从左往右找，第一个「本机已安装」的字体生效；
+           前两个是常见阿语文档字体（Noto Naskh Arabic 为开源阿语字体），
+           最后的 sans-serif 是兜底（无衬线通用字体，任何系统都有） */
     }
+    /* 译文区的样式：只改文字颜色，让译文与阿语原文有视觉区分 */
     .zh-trans {
-        color: #666;
+        color: #666;  /* 文字颜色：#666 是十六进制色值，表示中等灰色 */
     }
     </style>
     """,
@@ -201,10 +290,18 @@ if st.button("开始翻译与审校", type="primary"):
         # st.spinner：处理期间显示加载提示
         with st.spinner("正在处理…"):
             try:
-                # 运行流水线，结果存进 session_state，防止下次重跑时丢失
+                # 运行流水线，结果存进 session_state，防止下次重跑时丢失；
+                # 异常时不执行赋值 → 页面保留上次成功的结果（旧结果不丢）
                 st.session_state["results"] = run_pipeline(source)
             except FileNotFoundError as e:
                 st.error(f"数据文件缺失：{e}")
+            except translator.TranslationError as e:
+                # 翻译失败（网络/业务/解析错误）：异常消息已含段落号与
+                # 错误码，直接展示；页面不崩溃，保留上次成功结果
+                st.error(f"翻译失败：{e}")
+            except ValueError as e:
+                # 环境变量配置错误（如引擎取值非法、超时非正整数）
+                st.error(f"配置错误：{e}")
 
 # 有结果时渲染展示区（每次重跑都会重新渲染，保证结果不消失）
 if "results" in st.session_state:

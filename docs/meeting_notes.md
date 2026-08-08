@@ -44,3 +44,72 @@
 - 阶段 2：翻译 API 选型（届时新增 .env.example）
 - 阶段 3：审校报告格式与 LLM 选型（prompts/review_report_prompt.md 已预写模板骨架）
 - 后续：是否引入词边界规则、是否需要语料库支持
+
+## 2026-08-08 · 设计讨论：scan_glossary 归一化归属
+
+### 一、讨论背景
+
+用户提出设计疑问：modules/glossary.py 的 `scan_glossary` 在内部直接调用 `normalize_arabic`（归一化每个词条与每个段落），按单一职责原则（SRP），归一化是否应该挪到 app.py？
+
+### 二、讨论结论（用户拍板：保持现状）
+
+| 观点 | 结论 |
+|---|---|
+| 观察是否成立 | 成立——scan_glossary 内部确实做了「归一化 + 匹配」两段操作 |
+| 是否移到 app.py | **否**。理由：1) 归一化是匹配的内部准备步骤，scan 的单一职责是「产出命中报告」，归一化与子串匹配强耦合（匹配正确性依赖归一化）；2) 移到 app.py 违反**分层职责**——app.py 是 UI 层，掺入文本处理编排与纯函数原则冲突；3) 拆开会产生「输入必须已归一化」的隐藏前置条件，调用方与测试都易踩坑 |
+| 现状是否已满足 SRP | 是——`normalize_arabic` 是独立公开函数、有 8 条独立测试；scan 内部只是组合它，职责已分离 |
+| 未来可选项 | 若需再拆，正确位置是 glossary.py **内部**抽私有辅助步骤（如 `_prepare_entries` / `_prepare_paragraphs`），公共 API 与测试不变 |
+
+### 三、经验记录
+
+「单一职责」的判断单位是**函数承担的职责**（scan 的职责是产出命中报告），不是「函数内出现了几个操作」；归一化是完成该职责的准备步骤，属内聚而非职责混杂。另外，**分层职责**（UI / 业务逻辑）是更大尺度上的 SRP——把业务逻辑挪进 UI 层是反向违规。
+
+## 2026-08-08 · 第 2 阶段需求确认与设计决策
+
+### 一、需求确认（与用户逐项确认）
+
+| 决策点 | 结论 |
+|---|---|
+| 翻译 API | 阿里云机器翻译 TranslateGeneral（RPC 风格、HMAC-SHA1 手写签名，**不引 SDK**），方向 ar→zh |
+| 双模式 | `TRANSLATION_ENGINE` = mock（占位，默认）/ api（真实翻译）；非法值抛 ValueError |
+| 缺 key 行为 | api 模式无 AK/Secret → **不报错**，回退占位译文 + 页面黄色提示 |
+| 术语约束 | `build_translation_constraints` 正常生成（按段落过滤），但**不发送**——已核实阿里云该 API 无 context/术语参数；payload 预留 `params["Context"]` 注释位（阶段 3 接 LLM 时启用） |
+| DeepSeek | key 仅写 .env 预留 + .env.example 占位；本阶段不读取不调用 |
+| 逐段策略 | 逐段串行、一次一段；**一段失败中断整批**，异常携带段落号（1 基） |
+| 依赖 | 允许新增 requests、python-dotenv；禁止 pandas/FastAPI/Dify/React/SQLite/LangChain |
+| 环境变量 | TRANSLATION_* / ALIYUN_* 命名；dotenv 只在 app.py 顶部加载（modules/ 不 import，可测试性） |
+| 测试 | 保留阶段 1 全部测试（占位文案逐字节不变）；新增约 25 条（配置/签名/payload/双模式/约束/错误路径） |
+| 实施方式 | **Evaluator-Optimizer 双 Agent 协作**：Optimizer 实施 → Evaluator 只读审查（契约/测试/安全红线/风格）→ 循环至无 blocker |
+
+### 二、开发中发现的问题记录
+
+1. **空环境变量必须回落默认值**（冒烟发现）：`.env` 模板留空（`TRANSLATION_ENGINE=`）时读到空串，原实现按非法值抛 ValueError，导致「复制模板什么都不填」直接崩溃。已修：engine/timeout/endpoint/语言/场景统一「空串 = 未设置 = 默认值」；AK/SK 刻意不回落（空串正是「缺凭证 → 回退占位」的判定依据）。测试同步修正（空串不再视为非法）。
+2. **api 模式空输入不发请求**：契约「空输入 → []」在 api 模式同样成立（先于配置加载与循环返回），补测试锁定。
+3. **签名联调一次通过**：真实网络冒烟（`TRANSLATION_ENGINE=api` + .env 真 key）返回真实译文「欢迎来到阿拉伯项目」，验证签名算法、密钥、账号开通全部正确。测试内 known-answer 冻结值亦经独立 hmac 参考实现交叉验证。
+4. **RPC 签名要点**（踩坑预防）：参数键按字典序排序后各自 percentEncode（safe="-_.~"，空格→%20）；StringToSign 的 `%2F` 会再被整体编码成 `%252F`（双重编码特征，勿手工再编码）；POST body 直接用规范化查询串保证「发送字节 == 签名字节」；HTTP 200 但 Code≠"200" 是业务错误（InvalidAccessKeyId / ServiceNotOpened / SignatureDoesNotMatch）。
+
+### 三、验证结果
+
+- 全量测试 73 条全绿（阶段 1 的 47 条 + 阶段 2 新增 26 条）
+- 手动冒烟三状态全部通过：mock（占位，无警告）/ api 缺 key（占位 + fallback=True）/ api 真 key（真实译文）
+- 安全核查：代码/测试/.env.example/日志无任何真实密钥；.env（gitignored）只存本地
+- 用户密钥曾在聊天中暴露，联调通过后建议在阿里云/DeepSeek 控制台**轮换重置**
+
+## 2026-08-08 · 阶段 2 收尾重构：配置拆分 settings.py
+
+### 一、背景
+
+用户反馈 translator.py（584 行）混杂「配置（常量/默认值）+ 类型定义（TranslationConfig、配置加载）+ 翻译逻辑」，文件繁琐、修改不便。提出新建 settings 文件集中管理。
+
+### 二、决策（用户拍板）
+
+| 决策点 | 结论 |
+|---|---|
+| 是否拆分 | **是**——新建 modules/settings.py 作为翻译配置中心 |
+| 拆哪些 | 环境变量名（ENV_* 常量，改名只动一处）、引擎标识（MOCK/API_ENGINE）、默认值（DEFAULT_*）、TranslationConfig、load_translation_config |
+| 异常体系 | **留在 translator.py**——错误是翻译行为的对外契约（app.py 用 except translator.TranslationError 捕获），与翻译逻辑强相关；配置模块不混杂错误类型 |
+| 引用方式 | 引用方显式从正确模块导入（不做 re-export 转发），避免隐藏依赖：配置符号从 settings 取，翻译符号从 translator 取 |
+
+### 三、经验记录
+
+「文件过大、职责混杂」是重构信号。拆分依据是**内聚**：配置是「数据」、翻译是「行为」、异常是「行为的失败契约」——数据与行为分离是自然边界，失败契约跟随行为。纯搬迁重构后 73 条测试零改动全绿，验证「行为零变化」的重构正确性。

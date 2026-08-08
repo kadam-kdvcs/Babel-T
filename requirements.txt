@@ -1,6 +1,10 @@
-# 项目依赖（阶段 1 最小集）
+# 项目依赖
 # streamlit：网页界面框架
 # pytest：单元测试
-# 注意：本阶段不 import pandas；后续阶段按需追加依赖
+# requests：HTTP 客户端，阶段 2 起用于调用阿里云机器翻译 API（手写 RPC 签名，不引入 SDK）
+# python-dotenv：阶段 2 起用于从项目根目录 .env 文件读取环境变量（密钥只放 .env，绝不写进代码）
+# 注意：不 import pandas；后续阶段按需追加依赖
 streamlit>=1.41
 pytest>=8.0
+requests>=2.31
+python-dotenv>=1.0
