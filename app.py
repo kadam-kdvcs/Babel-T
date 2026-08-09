@@ -1,14 +1,23 @@
-"""Streamlit 页面入口（第 2 阶段）：阿拉伯语翻译审校助手 MVP。
+"""Streamlit 页面入口（第 3 阶段）：阿拉伯语翻译审校助手 MVP。
 
 页面布局：
 1. 标题与说明
 2. 阿语文本输入框（预填示例文本）
 3. 「开始翻译与审校」按钮
-4. 五个展示区：双语对照 / 术语命中 / 专名命中 / 审校报告
+4. 四个展示区：双语对照 / 术语命中 / 专名命中 / 审校报告
 
 翻译双模式（阶段 2）：默认 mock（占位译文，不联网）；配置阿里云
-密钥后走 api（真实翻译）。api 缺密钥时自动回退占位译文并提示，
-任一翻译异常时页面提示错误、保留上次成功结果。
+密钥后走 api（真实翻译）。api 缺密钥时自动回退占位译文并提示。
+
+审校双模式（阶段 3）：默认 mock（占位报告，不联网）；配置 DeepSeek
+密钥后走 api（LLM 审校报告，读取 prompts/review_report_prompt.md
+提示词模板）。api 缺密钥时自动回退占位报告并提示。任一异常时页面
+提示错误、保留上次成功结果（翻译结果不丢）。
+
+开发调试视图（阶段 3）：页面提供 st.radio 切换「仅 LLM 校准」与
+「LLM 校准 + API 翻译结果」两种视图——该控件只影响展示区内容，
+不影响 run_pipeline 的执行：翻译与审校照常运行（API 机器翻译是
+不可省略的主步骤，LLM 审校是校准辅助，二者缺一不可）。
 
 本文件是唯一包含 UI 的模块；流水线逻辑集中在 run_pipeline()，
 不依赖页面状态，可在命令行直接调用验证。
@@ -53,6 +62,13 @@ TERM_COLUMNS = ["阿语原文", "中文译文", "类别", "领域", "备注", "�
 # 专名命中表要展示的列（proper_names.csv 四列表头 + 扫描补充的两列）
 NAME_COLUMNS = ["阿语原文", "中文译文", "类别", "备注", "段落", "出现次数"]
 
+# 开发调试视图的两个选项文案（st.radio 的两个选项）。
+# 比较视图时用这两个常量而不是手写字符串：选项文案一旦改动，只需改
+# 这里一处，避免「选项文案改了、比较处的字面量没同步」导致视图判断
+# 永远出错。
+VIEW_REPORT_ONLY = "仅 LLM 校准（审校报告）"
+VIEW_REPORT_WITH_TRANSLATIONS = "LLM 校准 + API 翻译结果（双语对照与译文区）"
+
 
 def _load_sample() -> str:
     """读取示例文本，供输入框首次渲染预填。
@@ -81,12 +97,14 @@ def run_pipeline(text: str) -> dict:
           translations         译文列表（占位或真实翻译）
           term_hits            术语命中列表
           name_hits            专名命中列表
-          report               占位审校报告字符串
+          report               审校报告字符串（占位或 LLM 生成）
           translation_mode     "mock" 或 "api"（本次生效的翻译模式）
           translation_fallback True 表示「api 模式但缺密钥，本次用了占位译文」
+          review_mode          "mock" 或 "api"（本次生效的审校模式）
+          review_fallback      True 表示「api 模式但缺密钥，本次用了占位报告」
     异常：数据文件缺失时抛出 FileNotFoundError；翻译失败抛
-          translator.TranslationError 家族；环境变量非法抛 ValueError
-          （全部由 UI 层转成页面提示）。
+          translator.TranslationError 家族；审校失败抛 reviewer.ReviewError
+          家族；环境变量非法抛 ValueError（全部由 UI 层转成页面提示）。
     """
     # 段落切分：整篇文本 → 段落列表
     paragraphs = segmenter.segment_paragraphs(text)
@@ -112,8 +130,17 @@ def run_pipeline(text: str) -> dict:
         config.engine == settings.API_ENGINE and not config.has_credentials
     )
 
-    # 占位审校报告（阶段 3 接入 LLM 后替换）
+    # 审校报告（阶段 3 双模式：mock 生成占位报告，api 调 LLM 生成真报告）
     report = reviewer.generate_review_report(paragraphs, translations, term_hits, name_hits)
+
+    # 读取本次生效的审校配置，确定「模式」与「是否回退占位」两个展示键
+    # （与上方翻译配置块对称：页面直接读这两个键渲染提示，不在 UI 层
+    # 重复推断配置逻辑；环境变量非法时这里会抛 ValueError）
+    review_config = settings.load_review_config()
+    review_mode = review_config.engine
+    review_fallback = (
+        review_config.engine == settings.API_ENGINE and not review_config.has_credentials
+    )
 
     return {
         "paragraphs": paragraphs,
@@ -123,6 +150,8 @@ def run_pipeline(text: str) -> dict:
         "report": report,
         "translation_mode": translation_mode,
         "translation_fallback": translation_fallback,
+        "review_mode": review_mode,
+        "review_fallback": review_fallback,
     }
 
 
@@ -155,11 +184,16 @@ def _hits_to_rows(hits: list[dict], columns: list[str]) -> list[dict]:
     return rows
 
 
-def render_results(results: dict) -> None:
-    """渲染五个结果展示区。
+def render_results(results: dict, show_translations: bool = True) -> None:
+    """渲染四个结果展示区（双语对照 / 术语命中 / 专名命中 / 审校报告）。
 
-    作用：把 run_pipeline 的结果按「双语对照 / 术语命中 / 专名命中 / 审校报告」渲染到页面。
-    输入：results —— run_pipeline 的输出 dict。
+    作用：把 run_pipeline 的结果按「双语对照 / 术语命中 / 专名命中 /
+          审校报告」渲染到页面。
+    输入：results —— run_pipeline 的输出 dict；
+          show_translations —— 是否显示「双语对照」整节。为 False 时
+          跳过该节（术语/专名命中表仍显示——它们是审校依据），供
+          「仅 LLM 校准」调试视图使用。该参数只影响展示，不影响
+          run_pipeline 的执行。
     输出：无（直接向页面输出控件）。
     """
     # 回退提示：配置了 api 模式但没配密钥（run_pipeline 已判定回退），
@@ -168,41 +202,45 @@ def render_results(results: dict) -> None:
     if results.get("translation_fallback"):
         st.warning("已配置 API 模式但未配置密钥，本次使用占位译文。")
 
-    st.subheader("双语对照")
-    # zip：把段落与译文一一配对；enumerate：从 1 开始编号段落
-    for i, (paragraph, translation) in enumerate(
-        zip(results["paragraphs"], results["translations"]), start=1
-    ):
-        st.markdown(f"**第 {i} 段（阿语）**")
-        # ---- 下面这行同时涉及 HTML 转义与换行处理，说明如下 ----
-        # html.escape(paragraph)：把用户文本里的 < > & 等特殊字符转成安全写法
-        #   （如 < 变成 &lt;）。原因：这些字符如果原样进入页面，会被浏览器当成
-        #   网页代码执行——用户故意输入 <script> 就能注入脚本，这叫「注入攻击」。
-        #   escape 之后它们只会被当作普通文字显示，页面结构不受用户输入影响。
-        # .replace("\n", "<br>")：把段落内部的换行符换成 <br> 标签。
-        #   <br> 是 HTML 里的「换行」标签（break line 的缩写，写成 <br> 即换行）；
-        #   浏览器默认会把连续空白（含换行）压缩成一个空格，
-        #   所以不转成 <br> 的话，段内换行显示时会消失，整段挤成一行。
-        safe_paragraph = html.escape(paragraph).replace("\n", "<br>")
-        # <div> 是 HTML 的「分区」标签，表示一块独立的区域；
-        # class="ar-para" 给这块区域贴上名为 ar-para 的类标签，
-        # 于是上面 <style> 里的 .ar-para 规则就会只作用于这个元素（阿语区）。
-        # 注意顺序：必须先 escape 消毒、再套 <div> 标签，
-        # 保证用户输入里的尖括号不会破坏 div 标签本身的结构。
-        st.markdown(f'<div class="ar-para">{safe_paragraph}</div>', unsafe_allow_html=True)
-        # 译文标签随翻译模式变化：api 模式且未回退 → 真实译文，标签不带
-        # 「占位」字样；mock 模式或回退占位 → 带「占位」，提醒用户该译文
-        # 未经真实翻译，仅用于演示数据流。
-        if results.get("translation_mode") == settings.API_ENGINE and not results.get(
-            "translation_fallback"
+    # 双语对照整节：show_translations=False 时整体跳过。该节只是把
+    # run_pipeline 的结果再展示一遍（结果已在按钮点击时全部算好），
+    # 隐藏它不影响翻译/审校的执行，只影响本视图的显示内容。
+    if show_translations:
+        st.subheader("双语对照")
+        # zip：把段落与译文一一配对；enumerate：从 1 开始编号段落
+        for i, (paragraph, translation) in enumerate(
+            zip(results["paragraphs"], results["translations"]), start=1
         ):
-            st.markdown(f"**第 {i} 段（译文）**")
-        else:
-            st.markdown(f"**第 {i} 段（译文·占位）**")
-        # 译文区同理：div 标签 + zh-trans 类名，套用上面定义的灰色样式；
-        # 译文是我们自己的程序文本（无用户输入），仍 escape 一次做统一防护。
-        st.markdown(f'<div class="zh-trans">{html.escape(translation)}</div>', unsafe_allow_html=True)
-        st.divider()
+            st.markdown(f"**第 {i} 段（阿语）**")
+            # ---- 下面这行同时涉及 HTML 转义与换行处理，说明如下 ----
+            # html.escape(paragraph)：把用户文本里的 < > & 等特殊字符转成安全写法
+            #   （如 < 变成 &lt;）。原因：这些字符如果原样进入页面，会被浏览器当成
+            #   网页代码执行——用户故意输入 <script> 就能注入脚本，这叫「注入攻击」。
+            #   escape 之后它们只会被当作普通文字显示，页面结构不受用户输入影响。
+            # .replace("\n", "<br>")：把段落内部的换行符换成 <br> 标签。
+            #   <br> 是 HTML 里的「换行」标签（break line 的缩写，写成 <br> 即换行）；
+            #   浏览器默认会把连续空白（含换行）压缩成一个空格，
+            #   所以不转成 <br> 的话，段内换行显示时会消失，整段挤成一行。
+            safe_paragraph = html.escape(paragraph).replace("\n", "<br>")
+            # <div> 是 HTML 的「分区」标签，表示一块独立的区域；
+            # class="ar-para" 给这块区域贴上名为 ar-para 的类标签，
+            # 于是上面 <style> 里的 .ar-para 规则就会只作用于这个元素（阿语区）。
+            # 注意顺序：必须先 escape 消毒、再套 <div> 标签，
+            # 保证用户输入里的尖括号不会破坏 div 标签本身的结构。
+            st.markdown(f'<div class="ar-para">{safe_paragraph}</div>', unsafe_allow_html=True)
+            # 译文标签随翻译模式变化：api 模式且未回退 → 真实译文，标签不带
+            # 「占位」字样；mock 模式或回退占位 → 带「占位」，提醒用户该译文
+            # 未经真实翻译，仅用于演示数据流。
+            if results.get("translation_mode") == settings.API_ENGINE and not results.get(
+                "translation_fallback"
+            ):
+                st.markdown(f"**第 {i} 段（译文）**")
+            else:
+                st.markdown(f"**第 {i} 段（译文·占位）**")
+            # 译文区同理：div 标签 + zh-trans 类名，套用上面定义的灰色样式；
+            # 译文是我们自己的程序文本（无用户输入），仍 escape 一次做统一防护。
+            st.markdown(f'<div class="zh-trans">{html.escape(translation)}</div>', unsafe_allow_html=True)
+            st.divider()
 
     st.subheader("术语命中")
     term_rows = _hits_to_rows(results["term_hits"], TERM_COLUMNS)
@@ -220,7 +258,27 @@ def render_results(results: dict) -> None:
         st.caption("未命中任何专名。")
 
     st.subheader("审校报告")
-    st.info(results["report"])
+    # 审校回退提示：配置了 api 模式但没配密钥（run_pipeline 已判定回退），
+    # 本次报告是占位内容。黄色提示让用户第一眼看到，而不是只在报告
+    # 正文里隐晦体现。
+    if results.get("review_fallback"):
+        st.warning("已配置 LLM 校准 API 模式但未配置密钥，本次使用占位报告。")
+    if results.get("review_mode") == settings.API_ENGINE and not results.get(
+        "review_fallback"
+    ):
+        # api 真报告：LLM 输出的本身就是 markdown 文本（含 ## 标题、
+        # - 列表、**加粗** 等标记），st.markdown 会把它解析成页面上的
+        # 富文本格式（标题变大、列表自动缩进等）。
+        # 这里故意不传 unsafe_allow_html=True：Streamlit 默认把字符串里
+        # 的 HTML 标签（如 <script>、<div>）当作普通文字转义显示、不执行。
+        # 报告文本来自 LLM，万一它输出了恶意标签，也不会在页面里生效，
+        # 这样更安全；代价是报告里若有真 HTML 会以原样文本显示，不影响
+        # 阅读审校内容。
+        st.markdown(results["report"])
+        st.caption("以上审校报告由 LLM 生成，仅供人工复核参考；请以原文与术语库为准。")
+    else:
+        # mock 模式或回退占位：报告是纯占位文本，用 st.info 灰底信息框展示
+        st.info(results["report"])
 
 
 # ---------- 页面主体（脚本每次交互都会整体重跑） ----------
@@ -231,9 +289,10 @@ st.set_page_config(page_title="阿语审校助手 MVP", layout="wide")
 # st.title：页面大标题；st.caption：标题下的灰色说明文字
 st.title("阿拉伯语翻译审校助手（MVP）")
 st.caption(
-    "第 2 阶段：翻译支持双模式——默认 mock（占位译文，不联网）；"
+    "第 3 阶段：翻译支持双模式——默认 mock（占位译文，不联网）；"
     "配置阿里云密钥后走 api 真实翻译，缺密钥时自动回退占位译文并提示。"
-    "审校报告仍为占位内容（第 3 阶段接入 LLM）。"
+    "审校报告支持双模式——默认 mock（占位报告，不联网）；"
+    "配置 DeepSeek 密钥后走 api 真实 LLM 审校，缺密钥时自动回退占位报告并提示。"
 )
 
 # ---- 注入自定义样式（HTML + CSS 知识，供初学者参考）----
@@ -299,10 +358,37 @@ if st.button("开始翻译与审校", type="primary"):
                 # 翻译失败（网络/业务/解析错误）：异常消息已含段落号与
                 # 错误码，直接展示；页面不崩溃，保留上次成功结果
                 st.error(f"翻译失败：{e}")
+            except reviewer.ReviewError as e:
+                # 审校失败（网络/业务/解析错误）：异常消息均为中文且不含
+                # 密钥，直接展示；页面不崩溃，保留上次成功结果
+                # （api 翻译结果自然保留，不因审校失败丢失）
+                st.error(f"审校失败：{e}")
             except ValueError as e:
                 # 环境变量配置错误（如引擎取值非法、超时非正整数）
                 st.error(f"配置错误：{e}")
 
-# 有结果时渲染展示区（每次重跑都会重新渲染，保证结果不消失）
+# ---- 开发调试视图（只影响展示，不影响执行）----
+# st.radio：单选按钮组控件。第一个参数是问题/标签文字，第二个参数是
+# 选项元组，horizontal=True 让选项横排显示，index=1 表示默认选中第 2 个
+# 选项（下标从 0 开始），key="review_view" 让 Streamlit 记住用户的选择
+# （页面重跑后不重置）。
+# 该控件只是「显示开关」：翻译与审校在点击按钮时已经全部执行完毕
+# （结果存在 session_state 里），切换视图不触发任何重新计算，也绝不
+# 跳过 run_pipeline——系统定位：API 机器翻译是不可省略的主步骤，LLM
+# 审校是校准辅助，二者每次照常执行。
+view_mode = st.radio(
+    "开发调试：审校视图（只影响下方展示；翻译与审校照常执行）",
+    (VIEW_REPORT_ONLY, VIEW_REPORT_WITH_TRANSLATIONS),
+    horizontal=True,
+    index=1,
+    key="review_view",
+)
+st.caption("提示：翻译 API 是不可省略的步骤，本按钮只切换展示区，run_pipeline 照常执行。")
+
+# 有结果时渲染展示区（每次重跑都会重新渲染，保证结果不消失）；
+# show_translations=False 时隐藏「双语对照」整节（术语/专名命中表仍显示）
 if "results" in st.session_state:
-    render_results(st.session_state["results"])
+    render_results(
+        st.session_state["results"],
+        show_translations=(view_mode == VIEW_REPORT_WITH_TRANSLATIONS),
+    )

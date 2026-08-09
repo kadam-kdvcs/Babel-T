@@ -113,3 +113,34 @@
 ### 三、经验记录
 
 「文件过大、职责混杂」是重构信号。拆分依据是**内聚**：配置是「数据」、翻译是「行为」、异常是「行为的失败契约」——数据与行为分离是自然边界，失败契约跟随行为。纯搬迁重构后 73 条测试零改动全绿，验证「行为零变化」的重构正确性。
+
+## 2026-08-09 · 第 3 阶段需求确认与设计决策
+
+### 一、需求确认（与用户逐项确认）
+
+| 决策点 | 结论 |
+|---|---|
+| 审校引擎 | DeepSeek / OpenAI 兼容接口（requests 直调，**不引 openai SDK**）；`REVIEW_ENGINE` = mock（占位报告，默认）/ api |
+| 配置归属 | **全部进 settings.py**（统一配置中心：ReviewConfig + load_review_config，沿用 ENV_* 常量 / 空串回落 / 非法值抛中文 ValueError / api_key 刻意不回落） |
+| 失败策略 | 与阶段 2 对称：api 缺 key → 回退占位报告 + 黄条（review_fallback）；调用失败（网络/业务/解析）→ 抛 `ReviewError` 家族 → 页面红条，**旧结果保留（api 翻译结果不丢）** |
+| mock 报告 | 与阶段 1 占位文案**逐字节一致**（旧 3 条测试零改动） |
+| URL 语义 | `DEEPSEEK_API_URL` 是 **base URL**（默认 https://api.deepseek.com，内部拼 /chat/completions 去重尾斜杠） |
+| 系统定位 | **API 机器翻译是不可省略的主步骤，LLM 是不可缺少的校准辅助**——翻译 API 无法接入术语表（阿里云 TranslateGeneral 无 context 参数），术语一致性必须由 LLM 依据术语库把关；**LLM 报告以真实翻译结果为审校依据**，二者都执行 |
+| 调试视图按钮 | st.radio 两态（默认全量视图）：仅 LLM 校准 = 只隐藏「双语对照」整节（术语/专名表仍显示，它们是审校依据）/ LLM 校准 + API 翻译结果 = 全量；**只影响展示，不影响 run_pipeline 执行** |
+| 报告结构 | 8 项：文本概况 / 术语命中与风险 / 专名命中与统一性 / 重点风险句段 / 语体与领域适配 / 文化政治语境提醒 / 总体结论 / 人工复核建议 |
+| 模板 | prompts/review_report_prompt.md 重写：「## 用户消息」为系统/用户消息分界；4 占位符在**用户段**各恰好 1 次（Evaluator 建议强化） |
+| 测试 | 旧 3 条零改动 + 新增 26 条（monkeypatch 不打真实网络、假 key、不 import app.py） |
+| 实施方式 | **Evaluator-Optimizer 双 Agent 协作**（本阶段延续）：Optimizer 实施 → Evaluator 只读审查 → 反馈循环至无 blocker |
+
+### 二、开发中发现的问题记录（Evaluator 反馈）
+
+1. **占位符校验应针对用户段**（审查发现）：原 `_load_prompt_template` 只校验 4 占位符在全模板各恰好 1 次——若占位符被误挪进系统消息段，校验通过但用户消息会残留字面 `{source_paragraphs}`。已修：标记与占位符校验全部针对 split 后的**用户段**，并校验「## 系统消息」「## 用户消息」两个标记都存在且顺序正确。
+2. **模板头部说明不应发给 LLM**（审查发现）：文件标题行与维护者说明 blockquote 原会随系统消息发送（提示词噪音）。已修：系统段截到「## 系统消息」标记之后。
+3. **计划计数笔误**（信息性）：.env.example 计划写「9 → 14」实际 9 → 13（DEEPSEEK_API_KEY 阶段 2 已存在，本次新增 4 个 + 1 个占位注释转正式），已同步修正计划文件。
+
+### 三、验证结果
+
+- 全量测试 99 条全绿（阶段 1/2 的 73 条零改动 + 阶段 3 新增 26 条）
+- 冒烟：mock 占位（review_mode=mock）/ api 缺 key 回退（review_fallback=True）/ api 真 key 8 项报告 / api 假 key st.error「审校失败」旧结果保留；radio 两种视图切换正常
+- 安全核查：代码/测试/文档无任何真实密钥；异常消息不含密钥；业务错误片段截断 200 字符；st.markdown 渲染 LLM 输出不传 unsafe_allow_html（防注入）
+- 用户密钥曾在聊天中暴露，联调通过后建议在阿里云/DeepSeek 控制台**轮换重置**

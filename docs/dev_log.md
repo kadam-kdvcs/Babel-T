@@ -132,7 +132,62 @@
 
 ---
 
-## 附：环境变量一览（模块 modules/settings.py:38-46）
+## 阶段 3（2026-08-09）：接入 LLM 生成审校报告（双模式 + 8 项报告结构）
+
+**目标**：把占位审校报告升级为可配置的 LLM 审校报告（DeepSeek / OpenAI 兼容接口，requests 直调不引 SDK）。reviewer.py 双模式 mock/api；配置集中 settings.py；缺 key 回退占位；调用失败抛 ReviewError 家族；8 项报告结构模板；开发调试视图 radio。系统定位：API 翻译是不可省略的主步骤，LLM 是不可缺少的校准辅助（翻译 API 无法接入术语表，术语一致性靠 LLM 把关）。
+
+### 新增文件
+
+| 文件 | 行号 | 内容与作用 |
+|---|---|---|
+| docs/stage3_plan.md | 全文 | 阶段 3 实施计划（已批准并实施完成） |
+
+### 修改文件
+
+| 文件 | 行号 | 改动内容与作用 |
+|---|---|---|
+| modules/settings.py | :15-30（docstring）、:56-60、:80-82、:124-151、:212-263 | docstring 更新为「翻译与审校配置中心」；新增 5 个 ENV_* 常量（REVIEW_ENGINE/DEEPSEEK_API_KEY/DEEPSEEK_API_URL/REVIEW_MODEL/REVIEW_TIMEOUT_SECONDS，删除原 DEEPSEEK_API_KEY 预留注释行）；新增 3 个 DEFAULT_*（DEFAULT_DEEPSEEK_API_URL=base URL 无尾斜杠 / DEFAULT_REVIEW_MODEL=deepseek-chat / DEFAULT_REVIEW_TIMEOUT=30）；新增 ReviewConfig（frozen dataclass，has_credentials=bool(api_key)）；新增 load_review_config（与 load_translation_config 完全对称：空串回落/非法 engine 中文 ValueError/timeout 正整数校验/api_key 刻意不回落） |
+| modules/reviewer.py | 整体重写（41 → 约 400 行） | 占位实现替换为双模式：异常家族（ReviewError → Network/Business/Parse，全中文不含密钥）、generate_review_report 编排（签名不变；空输入短路 api 不发请求；mock/缺 key → _generate_mock_report 占位文案与阶段 1 逐字节一致）、_load_prompt_template（UTF-8 读取；缺文件 FileNotFoundError；校验「## 系统消息」「## 用户消息」标记与用户段 4 占位符各恰好 1 次）、_format_hits_text（两库 .get 兼容；「【术语命中】共 N 条…」格式；无命中输出「无」）、_format_numbered（「第N段：」编号）、_render_user_message（split 后 str.replace 替换；系统段截到「## 系统消息」后）、_build_api_url（rstrip("/")+"/chat/completions"）、_build_request_payload（model+messages 双角色+temperature=0.3）、_review_with_api（编排+POST Bearer）、_parse_review_response（六类错误分类） |
+| prompts/review_report_prompt.md | 整体重写 | 结构：标题+说明 →「## 系统消息」（角色设定 + 8 项输出结构每项带指示 + 3 条约束：不重翻全文/不添加原文没有的信息/术语以术语库为准含处理方式语义）→「## 用户消息」（数据说明 + 4 占位符各恰好 1 次） |
+| app.py | :1-15（docstring）、:33、:100-115（run_pipeline 9 键）、:116-126（return）、:158-165（render_results 签名与 docstring）、:166-168（fallback 提示）、:168-183（show_translations 跳过双语对照）、:227-240（报告区三分支）、:295-307（except 链加 ReviewError）、:338-355（radio+调用）、:374-381（caption） | 模块 docstring 与 caption 更新阶段 3；run_pipeline 追加 review_config/review_mode/review_fallback（与翻译配置块对称），返回 9 键；except 链新增 reviewer.ReviewError（夹在 TranslationError 与 ValueError 之间）；新增 VIEW_REPORT_ONLY/VIEW_REPORT_WITH_TRANSLATIONS 常量与 st.radio（index=1 默认全量、key="review_view"、教学注释）+ caption「翻译 API 是不可省略的步骤…」；render_results 加 show_translations 参数（False 时跳过双语对照整节，术语/专名表仍显示）；报告区三分支（fallback→st.warning / api 真报告→st.markdown 不传 unsafe_allow_html+caption / mock→st.info） |
+| tests/test_reviewer.py | 旧 3 条零改动 + 新增 26 条 | 配置 6（默认值/读环境+strip/非法 engine+空串回落/timeout 非法+空串回落/URL 空串回落+api_key 不回落）、双模式 4（mock 不联网/api 缺 key 回退逐字节相同/api 空输入不发请求/api 成功 1 次 post）、模板 4（替换正常无残留/缺文件/缺占位符/缺标记）、hits 格式化 3（术语六列/专名四列不抛 KeyError/全空「无」）、请求构造 3（URL 去尾斜杠/body 结构含不含 key 安全断言/headers+timeout）、错误路径 6（401→Business 不含 key/超时/连接/非 JSON/缺 choices/缺 content）；辅助 _FakeResponse（含 text）/ _fixed_fake_post / _set_api_review_env / _write_template 模板 fixture |
+| .env.example | :36-48 | 原 DEEPSEEK_API_KEY 预留注释转正式（含安全提醒）；追加 REVIEW_ENGINE / DEEPSEEK_API_URL（注明 base URL 自动拼 /chat/completions）/ REVIEW_MODEL / REVIEW_TIMEOUT_SECONDS（9 → 13 个变量） |
+| CLAUDE.md | :5、:9-10、:34、:53-54、:65-72 | 项目定位更新（翻译+LLM 审校）；技术栈「阶段 3 已接 LLM 审校（DeepSeek OpenAI 兼容、requests 直调、双模式 mock/api）」；目录 prompts 注释「阶段 3 已启用」；关键设计约定新增「审校双模式（阶段 3）」（LLM 配置集中 settings、异常留 reviewer、URL 语义、temperature 固定、LLM 定位校准辅助、radio 只影响展示）；当前阶段决策更新为阶段 3 |
+| README.md | :3、:5-50、:64-72、:120-127 | 介绍与当前阶段更新为阶段 3；新增「审校双模式」表与 LLM 定位说明；「本阶段明确不做」更新（LLM 审校移除、加不让 LLM 重翻全文等）；目录结构 reviewer/prompts/docs 注释更新；快速开始补 REVIEW_ENGINE/DEEPSEEK_API_KEY 配置；路线图阶段 2 勾选完成、阶段 3 当前 |
+| docs/modules.md | :18-19（数据流图）、:65-91（settings 节）、:117-139（reviewer 节重写）、:147-151、:160-165（app 节）、:178（tests 表） | 数据流图 reviewer 支路加 LLM 模板；settings 节改「翻译与审校配置中心」加 ReviewConfig/load_review_config；reviewer 节整体重写（双模式编排/异常家族/私有函数/模板文件说明）；app 节 run_pipeline 9 键、except 链 4 类、radio 与报告区三分支；tests 表 test_reviewer 更新 26 条说明 |
+| docs/meeting_notes.md | 末尾 | 追加「2026-08-09 · 第 3 阶段需求确认与设计决策」（需求确认表 10 项 + Evaluator 反馈问题 2 条 + 验证结果） |
+
+### 阶段 3 开发中发现并修复的问题（Evaluator 反馈）
+
+1. 占位符校验从「全模板」强化为「用户段」（防止占位符误挪进系统消息段时残留字面量）
+2. 模板头部说明（标题/维护者 blockquote）不再随系统消息发送（截到「## 系统消息」标记之后）
+3. 计划文件 .env.example 计数笔误「9 → 14」实为「9 → 13」，已同步修正
+
+### 阶段 3 验证
+
+- 99 条测试全绿（阶段 1/2 的 73 条零改动 + 新增 26 条）
+- 手动冒烟四状态：mock 占位 / api 缺 key 回退+黄条 / api 真 key 8 项报告 / api 假 key st.error「审校失败」旧结果保留；radio 两种视图切换正常
+- 安全核查：无密钥入代码/测试/文档/异常消息；业务错误片段截断 200 字符；st.markdown 不传 unsafe_allow_html
+
+---
+
+## 附：环境变量一览（模块 modules/settings.py）
+
+| 变量 | 默认值 | 用途 |
+|---|---|---|
+| TRANSLATION_ENGINE | mock | 翻译引擎模式：mock 占位 / api 真实翻译 |
+| ALIYUN_ACCESS_KEY_ID | 空 | 阿里云凭证（api 必需，缺了回退占位） |
+| ALIYUN_ACCESS_KEY_SECRET | 空 | 阿里云凭证（同上） |
+| ALIYUN_MT_ENDPOINT | https://mt.aliyuncs.com/ | 翻译服务地址 |
+| TRANSLATION_SOURCE_LANG | ar | 源语言 |
+| TRANSLATION_TARGET_LANG | zh | 目标语言 |
+| TRANSLATION_SCENE | general | 翻译场景 |
+| TRANSLATION_TIMEOUT_SECONDS | 30 | 翻译单请求超时 |
+| REVIEW_ENGINE | mock | 审校引擎模式：mock 占位 / api LLM 审校（阶段 3 新增） |
+| DEEPSEEK_API_KEY | 空 | DeepSeek 凭证（api 必需，缺了回退占位；阶段 3 转正式） |
+| DEEPSEEK_API_URL | https://api.deepseek.com | LLM base URL，自动拼 /chat/completions（阶段 3 新增） |
+| REVIEW_MODEL | deepseek-chat | LLM 审校模型名（阶段 3 新增） |
+| REVIEW_TIMEOUT_SECONDS | 30 | LLM 审校单请求超时（阶段 3 新增） |
 
 | 变量 | 默认值 | 用途 |
 |---|---|---|
