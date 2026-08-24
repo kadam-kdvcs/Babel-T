@@ -100,30 +100,57 @@ def _set_api_review_env(monkeypatch):
 
 
 def _write_template(monkeypatch, tmp_path, content=None):
-    """写入测试专用提示词模板并把 _PROMPT_PATH 指向它。
+    """写入三阶段测试模板并分别指向直接/修正/最终仲裁路径。
 
-    作用：让被测代码读取到「含 4 个占位符 + 「## 用户消息」标记」的
-          测试模板，而不去碰项目里的真实模板文件。
+    作用：让被测代码读取到测试专用模板，不碰项目里的真实模板文件。
+          content 为 None 时会写入三份标准测试模板；指定 content 时覆盖
+          最终仲裁模板（供模板结构校验类测试使用）。
     输入：monkeypatch —— pytest 夹具；tmp_path —— pytest 临时目录；
-          content —— 模板内容（None 时用默认测试模板）。
-    输出：Path —— 写入的模板文件路径。
+          content —— 可选，最终仲裁模板内容。
+    输出：Path —— 最终仲裁模板文件路径。
     """
+    direct_path = tmp_path / "direct.md"
+    correct_path = tmp_path / "correct.md"
+    final_path = tmp_path / "final.md"
+
     if content is None:
-        content = (
-            "# 测试模板\n"
-            "## 系统消息\n"
-            "你是一位阿语-中文审校专家。\n"
-            "## 用户消息\n"
-            "原文段落：{source_paragraphs}\n"
-            "译文段落：{translations}\n"
-            "术语命中：{term_hits}\n"
-            "专名命中：{name_hits}\n"
+        direct_path.write_text(
+            "# 测试模板\n## 系统消息\n你是一位阿语-中文翻译专家。\n"
+            "## 用户消息\n原文段落：{source_paragraphs}\n"
+            "术语命中：{term_hits}\n专名命中：{name_hits}\n",
+            encoding="utf-8",
         )
-    prompt_path = tmp_path / "prompt.md"
-    # 显式指定 UTF-8 写入（Windows 默认 GBK，中文模板必须显式编码）
-    prompt_path.write_text(content, encoding="utf-8")
-    monkeypatch.setattr(reviewer, "_PROMPT_PATH", prompt_path)
-    return prompt_path
+        correct_path.write_text(
+            "# 测试模板\n## 系统消息\n你是一位阿语-中文审校专家。\n"
+            "## 用户消息\n原文段落：{source_paragraphs}\n"
+            "译文段落：{translations}\n术语命中：{term_hits}\n专名命中：{name_hits}\n",
+            encoding="utf-8",
+        )
+    else:
+        # 模板结构校验类测试：只覆盖最终仲裁模板
+        direct_path.write_text(
+            "# 测试模板\n## 系统消息\n专家。\n## 用户消息\n"
+            "原文：{source_paragraphs}\n术语：{term_hits}\n专名：{name_hits}\n",
+            encoding="utf-8",
+        )
+        correct_path.write_text(
+            "# 测试模板\n## 系统消息\n专家。\n## 用户消息\n"
+            "原文：{source_paragraphs}\n译文：{translations}\n术语：{term_hits}\n专名：{name_hits}\n",
+            encoding="utf-8",
+        )
+
+    final_content = content or (
+        "# 测试模板\n## 系统消息\n你是一位最终仲裁专家。\n"
+        "## 用户消息\n原文：{source_paragraphs}\n"
+        "直接翻译：{direct_translations}\n修正结果：{corrected_translations}\n"
+        "术语：{term_hits}\n专名：{name_hits}\n"
+    )
+    final_path.write_text(final_content, encoding="utf-8")
+
+    monkeypatch.setattr(reviewer, "_DIRECT_PROMPT_PATH", direct_path)
+    monkeypatch.setattr(reviewer, "_CORRECT_PROMPT_PATH", correct_path)
+    monkeypatch.setattr(reviewer, "_PROMPT_PATH", final_path)
+    return final_path
 
 
 # 固定的成功响应：OpenAI 兼容格式 choices[0].message.content 即报告文本
@@ -393,12 +420,13 @@ def test_review_api_empty_input_no_request(monkeypatch):
 
 
 def test_review_api_with_key_success(monkeypatch, tmp_path):
-    """验证 api 模式有密钥时调用 LLM 成功：恰好 1 次请求，返回报告文本。
+    """验证 api 模式有密钥时调用 LLM 成功：三次独立请求，返回报告文本。
 
-    作用：确认 api 全链路（模板加载 → 数据填充 → 请求 → 解析）——
-          有密钥时发出一次请求，响应里的 content 成为审校报告返回。
+    作用：确认 api 全链路（三个独立阶段调用）——
+          直接翻译、修正、最终仲裁各发一次请求，响应里的 content 成为
+          最终仲裁的审校报告返回。
     输入：api 模式 + 假密钥 + 测试模板；假 POST 返回固定成功响应。
-    输出：返回报告文本；calls 恰好 1 次调用。
+    输出：返回报告文本；calls 恰好 3 次调用。
     """
     _set_api_review_env(monkeypatch)
     _write_template(monkeypatch, tmp_path)
@@ -407,8 +435,8 @@ def test_review_api_with_key_success(monkeypatch, tmp_path):
 
     report = reviewer.generate_review_report(["阿语段落"], ["译文"], [], [])
     assert report == "（测试审校报告）"
-    # 恰好 1 次请求（单次调用、无重试）
-    assert len(calls) == 1
+    # 三个独立阶段：直接翻译 / 修正 / 最终仲裁
+    assert len(calls) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -416,15 +444,13 @@ def test_review_api_with_key_success(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_review_render_replaces_placeholders(monkeypatch, tmp_path):
-    """验证占位符全部替换：请求体含编号文本，不含字面占位符。
+    """验证三个阶段各自独立，且占位符全部替换、不互相污染。
 
-    作用：确认模板拆段与替换行为——系统消息截到「## 系统消息」标记
-          之后（含角色设定、不含文件头部说明文字）；用户消息已编号化
-          （「第1段：」），且 4 个占位符在发送的请求体里不再以字面量
-          形式出现（全部被替换成真实数据）。
+    作用：确认三个阶段调用分别使用不同的提示词模板与占位符集合：
+          直接翻译不含 API 译文；修正含原文+译文；最终仲裁含直接/修正结果。
+          每个请求体都不残留本阶段占位符字面量。
     输入：api 模式 + 假密钥 + 测试模板；2 段输入。
-    输出：系统消息含角色设定且不含头部标题；用户消息含「第1段：」
-          「第2段：」；不含任何 {占位符} 字面量。
+    输出：调用 3 次；每阶段系统消息与用户消息符合预期。
     """
     _set_api_review_env(monkeypatch)
     _write_template(monkeypatch, tmp_path)
@@ -433,21 +459,29 @@ def test_review_render_replaces_placeholders(monkeypatch, tmp_path):
 
     reviewer.generate_review_report(["段落甲", "段落乙"], ["译文甲", "译文乙"], [], [])
 
-    assert len(calls) == 1
-    # OpenAI 兼容请求体：messages[0] 是系统消息、messages[1] 是用户消息
-    system_message = calls[0]["json"]["messages"][0]["content"]
-    # 系统消息应截到「## 系统消息」标记之后：含角色设定文本，
-    # 不含文件头部（标题 + 维护者说明）——头部是给人看的说明，不是提示词
-    assert "你是一位阿语-中文审校专家" in system_message
-    assert "测试模板" not in system_message
+    assert len(calls) == 3
+    # 三阶段模板的角色设定应各不相同
+    expected_system_parts = [
+        "你是一位阿语-中文翻译专家",   # 直接翻译
+        "你是一位阿语-中文审校专家",   # 修正
+        "你是一位最终仲裁专家",         # 最终仲裁
+    ]
+    expected_placeholder_sets = [
+        reviewer._DIRECT_PLACEHOLDERS,
+        reviewer._CORRECT_PLACEHOLDERS,
+        reviewer._PLACEHOLDERS,
+    ]
+    for call_index, call in enumerate(calls):
+        system_message = call["json"]["messages"][0]["content"]
+        assert expected_system_parts[call_index] in system_message
+        assert "测试模板" not in system_message
 
-    user_message = calls[0]["json"]["messages"][1]["content"]
-    # 段落已编号化：出现「第1段：」「第2段：」
-    assert "第1段：" in user_message
-    assert "第2段：" in user_message
-    # 4 个占位符都已被替换，正文里不允许再出现字面占位符
-    for name in reviewer._PLACEHOLDERS:
-        assert f"{{{name}}}" not in user_message
+        user_message = call["json"]["messages"][1]["content"]
+        assert "第1段：" in user_message
+        assert "第2段：" in user_message
+        # 本阶段占位符已经全部被替换，不允许再出现字面量
+        for name in expected_placeholder_sets[call_index]:
+            assert f"{{{name}}}" not in user_message
 
 
 def test_review_template_missing_raises_file_not_found(monkeypatch, tmp_path):
@@ -673,17 +707,17 @@ def test_review_request_headers_url_timeout(monkeypatch, tmp_path):
 
     reviewer.generate_review_report(["阿语段落"], ["译文"], [], [])
 
-    assert len(calls) == 1
-    call = calls[0]
-    # URL = 默认 base URL + /chat/completions
-    assert call["url"] == settings.DEFAULT_DEEPSEEK_API_URL + "/chat/completions"
-    # headers：Bearer 认证头 + JSON 内容类型
-    assert call["headers"] == {
-        "Authorization": "Bearer fake_key",
-        "Content-Type": "application/json",
-    }
-    # 超时秒数来自配置（默认 30）
-    assert call["timeout"] == settings.DEFAULT_REVIEW_TIMEOUT
+    assert len(calls) == 3
+    for call in calls:
+        # URL = 默认 base URL + /chat/completions
+        assert call["url"] == settings.DEFAULT_DEEPSEEK_API_URL + "/chat/completions"
+        # headers：Bearer 认证头 + JSON 内容类型
+        assert call["headers"] == {
+            "Authorization": "Bearer fake_key",
+            "Content-Type": "application/json",
+        }
+        # 超时秒数来自配置（默认 30）
+        assert call["timeout"] == settings.DEFAULT_REVIEW_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -820,17 +854,17 @@ def test_review_missing_content_raises_parse_error(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 阶段 3.1 新增：审校结果包（审核报告 + LLM 纠正后译文）
+# 阶段 3.1/3.2 新增：审校结果包（四结果 + 审校报告）
 # ---------------------------------------------------------------------------
 
-def test_review_bundle_mock_returns_report_and_placeholder_corrected(monkeypatch):
-    """验证 mock 模式返回的结果包同时含占位报告与占位纠正译文。
+def test_review_bundle_mock_returns_placeholder_four_results(monkeypatch):
+    """验证 mock 模式返回的结果包含占位报告与三个占位 LLM 结果。
 
     作用：确认 _generate_mock_bundle 的数据结构——report 仍是阶段 1
-          占位报告；corrected_translations 是长度与段落一致的占位纠正
-          译文列表，且不发起网络请求。
+          占位报告；direct/corrected/final 三个结果列表长度与段落一致，
+          且均为独立占位文案，不发起网络请求。
     输入：REVIEW_ENGINE=mock；2 段输入。
-    输出：结果包含两键；报告含「占位」；纠正译文长度为 2 且含「占位纠正译文」。
+    输出：结果包含四键；报告含「占位」；三个列表长度都为 2。
     """
     monkeypatch.setenv(settings.ENV_REVIEW_ENGINE, settings.MOCK_ENGINE)
 
@@ -841,37 +875,71 @@ def test_review_bundle_mock_returns_report_and_placeholder_corrected(monkeypatch
 
     bundle = reviewer.generate_review_bundle(["段落A", "段落B"], ["译文A", "译文B"], [], [])
     assert "report" in bundle
+    assert "direct_translations" in bundle
     assert "corrected_translations" in bundle
+    assert "final_translations" in bundle
     assert "（占位）审校报告" in bundle["report"]
+    assert len(bundle["direct_translations"]) == 2
     assert len(bundle["corrected_translations"]) == 2
-    assert "占位纠正译文" in bundle["corrected_translations"][0]
+    assert len(bundle["final_translations"]) == 2
+    assert "占位直接翻译" in bundle["direct_translations"][0]
+    assert "占位修正译文" in bundle["corrected_translations"][0]
+    assert "占位最终结果" in bundle["final_translations"][0]
 
 
-def test_review_bundle_api_parses_corrected_and_report(monkeypatch, tmp_path):
-    """验证 api 结果包能从一次 LLM 回复中拆出纠正译文与审校报告。
+def test_review_bundle_api_parses_four_results(monkeypatch, tmp_path):
+    """验证 api 结果包从三次独立 LLM 回复中汇总四个结果与报告。
 
-    作用：模拟新版 LLM 返回「## 纠正后译文 + ## 审校报告」的完整结构，
-          确认 generate_review_bundle 把两段分别解析到正确键里，且仍只发起
-          1 次请求（不额外增加一次纠正调用）。
-    输入：api 模式 + 假密钥 + 测试模板；假响应 content 含两个二级标题。
-    输出：corrected_translations 为按段号提取的 2 条译文；report 为审校报告段。
+    作用：模拟三个阶段分别返回不同内容：
+          1. 直接翻译响应
+          2. 修正响应
+          3. 最终仲裁响应（最终结果 + 取舍说明 + 审校报告）
+          确认 generate_review_bundle 能把它们归到正确键里，共发起 3 次请求。
+    输入：api 模式 + 假密钥 + 测试模板；三份假响应。
+    输出：direct/corrected/final 三组译文正确；tradeoff_notes/report 正确。
     """
     _set_api_review_env(monkeypatch)
     _write_template(monkeypatch, tmp_path)
-    content = (
-        "## 纠正后译文\n\n"
-        "第1段：纠正后的译文一\n"
-        "第2段：纠正后的译文二\n\n"
+
+    direct_content = (
+        "## 直接翻译结果\n\n"
+        "第1段：直接译文一\n"
+        "第2段：直接译文二\n"
+    )
+    correct_content = (
+        "## API译文修正结果\n\n"
+        "第1段：修正译文一\n"
+        "第2段：修正译文二\n"
+    )
+    final_content = (
+        "## 最终结果\n\n"
+        "第1段：最终译文一\n"
+        "第2段：最终译文二\n\n"
+        "## 翻译取舍说明\n\n"
+        "第1段直接翻译与修正结果差异较大，最终以原文为依据选择合成结果。\n\n"
         "## 审校报告\n\n"
         "### 1. 文本概况\n这是测试报告。"
     )
-    ok_response = _FakeResponse(200, {"choices": [{"message": {"content": content}}]})
-    fake_post, calls = _fixed_fake_post(ok_response)
+    responses = [
+        _FakeResponse(200, {"choices": [{"message": {"content": direct_content}}]}),
+        _FakeResponse(200, {"choices": [{"message": {"content": correct_content}}]}),
+        _FakeResponse(200, {"choices": [{"message": {"content": final_content}}]}),
+    ]
+
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append({"url": url, "json": kwargs.get("json")})
+        return responses[len(calls) - 1]
+
     monkeypatch.setattr(reviewer.requests, "post", fake_post)
 
     bundle = reviewer.generate_review_bundle(["段落A", "段落B"], ["译文A", "译文B"], [], [])
-    assert len(calls) == 1
-    assert bundle["corrected_translations"] == ["纠正后的译文一", "纠正后的译文二"]
+    assert len(calls) == 3
+    assert bundle["direct_translations"] == ["直接译文一", "直接译文二"]
+    assert bundle["corrected_translations"] == ["修正译文一", "修正译文二"]
+    assert bundle["final_translations"] == ["最终译文一", "最终译文二"]
+    assert "第1段直接翻译与修正结果差异较大" in bundle["tradeoff_notes"]
     assert "### 1. 文本概况" in bundle["report"]
     assert "这是测试报告" in bundle["report"]
 
@@ -879,40 +947,46 @@ def test_review_bundle_api_parses_corrected_and_report(monkeypatch, tmp_path):
 def test_review_bundle_api_falls_back_when_no_sections(monkeypatch, tmp_path):
     """验证模型未按新版结构输出时，结果包安全回退。
 
-    作用：兼容旧版/降级响应——返回内容只有审校报告，没有纠正译文标题时，
-          corrected_translations 回退为原始译文列表，report 保留完整返回文本。
-          页面不会因此崩溃。
-    输入：api 模式；假响应 content 仅含普通报告文本。
-    输出：报告等于该文本；纠正译文等于原始译文列表。
+    作用：兼容旧版/降级响应——三个调用都返回没有新版标题的普通文本时，
+          direct/corrected/final 都回退为原始译文列表，report 保留整段文本。
+    输入：api 模式；三份旧版普通响应。
+    输出：报告等于该文本；direct/corrected/final 都等于原始译文列表。
     """
     _set_api_review_env(monkeypatch)
     _write_template(monkeypatch, tmp_path)
     ok_response = _FakeResponse(
         200, {"choices": [{"message": {"content": "（旧版审校报告）"}}]}
     )
-    fake_post, _ = _fixed_fake_post(ok_response)
+    fake_post, calls = _fixed_fake_post(ok_response)
     monkeypatch.setattr(reviewer.requests, "post", fake_post)
 
     bundle = reviewer.generate_review_bundle(["段落A"], ["原始译文"], [], [])
+    assert len(calls) == 3
     assert bundle["report"] == "（旧版审校报告）"
+    assert bundle["direct_translations"] == ["原始译文"]
     assert bundle["corrected_translations"] == ["原始译文"]
+    assert bundle["final_translations"] == ["原始译文"]
 
 
 def test_parse_review_bundle_falls_back_on_wrong_count(monkeypatch):
-    """验证纠正译文段数与原段落数不一致时回退原始译文。
+    """验证最终结果段数与原段落数不一致时回退修正结果。
 
     作用：LLM 偶尔漏段/多段时，若强行按提取结果展示会导致段落错位；
           这里锁定「数量不符即回退」的降级策略。
-    输入：content 含「## 纠正后译文」但只写了 1 段，而原文有 2 段。
-    输出：corrected_translations 返回原始 2 条译文，不抛异常。
+    输入：content 含「## 最终结果」但只写了 1 段，而原文有 2 段。
+    输出：final_translations 回退为 corrected_translations（修正译文列表）。
     """
     content = (
-        "## 纠正后译文\n\n"
-        "第1段：只有一个纠正\n\n"
+        "## 最终结果\n\n"
+        "第1段：只有一个最终\n\n"
+        "## 翻译取舍说明\n\n"
+        "因为测试所以省略。\n\n"
         "## 审校报告\n\n"
         "报告正文"
     )
-    bundle = reviewer._parse_review_bundle(content, ["段落A", "段落B"], ["译文A", "译文B"])
-    assert bundle["corrected_translations"] == ["译文A", "译文B"]
+    bundle = reviewer._parse_review_bundle(
+        content, ["段落A", "段落B"], ["修正A", "修正B"]
+    )
+    assert bundle["final_translations"] == ["修正A", "修正B"]
     assert "报告正文" in bundle["report"]
 

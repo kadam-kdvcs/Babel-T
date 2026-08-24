@@ -171,4 +171,32 @@
 ### 三、验证情况
 
 - `python -m py_compile` 通过；`run_pipeline` mock 冒烟返回 `corrected_translations` 且长度与段落一致
-- 全量 `python -m pytest -q` 通过：**103 passed**（99 条原有 + 4 条新增）
+- 全量 `python -m pytest -q` 通过：**105 passed**（103 条原有 + 2 条并发翻译新增）
+
+## 2026-08-24 · 第 3.2 阶段确认：LLM 直接翻译 / 修正 / 最终仲裁 + 四结果对比
+
+### 一、需求确认
+
+用户提出不能让 LLM 只“基于 API 译文修正”，而应执行完整多轮流程：
+
+1. LLM 直接翻译原文，持有一个结果；
+2. 基于 API 译文进行修正，持有一个结果；
+3. 比对两个结果并继续结合原文，产出最终结果；
+4. 最终仲裁以原文为最高依据，不能新加入原文未有的内容；
+5. 页面最终把四个结果都显示出来。
+
+### 二、设计决策
+
+| 决策点 | 结论 |
+|---|---|
+| 生成方式 | `generate_review_bundle` **分三次独立调用**返回 `direct_translations` + `corrected_translations` + `final_translations` + `tradeoff_notes` + `report` |
+| 提示词 | 三份独立模板：直接翻译 / 修正 / 最终仲裁；最终仲裁输出 `## 最终结果` / `## 翻译取舍说明` / `## 审校报告` |
+| 仲裁原则 | **最终结果以原文为最高依据，禁止添加原文未有的信息** |
+| 页面展示 | 移除原 radio，固定显示四结果对比 |
+| 回退策略 | 某段结果解析失败时：direct/corrected 回退原始译文，final 优先回退 corrected |
+| 测试 | 4 条 reviewer 结果包测试升级为四结果场景；全量 105 条通过 |
+
+### 三、验证情况
+
+- `python -m pytest -q`：**105 passed**
+- Playwright 真实 API/LLM 模式验证：页面显示四结果对比，每段四种译文标签齐全，无控制台错误

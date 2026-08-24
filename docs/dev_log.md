@@ -213,6 +213,45 @@
 
 ---
 
+## 阶段 3.2（2026-08-24）：LLM 直接翻译 / 修正 / 最终仲裁 + 四结果对比
+
+**目标**：用户要求 LLM 不能只“修正 API 译文”，而应该执行完整多轮流程：
+1. 直接翻译原文，得到一个结果；
+2. 基于 API 译文进行修正，得到第二个结果；
+3. 将两个结果比对并继续结合原文，仲裁出最终结果；
+4. 最终仲裁以原文为最高依据，禁止添加原文未有的信息；
+5. 页面将四个结果全部展示出来。
+
+**当前实现**：改为**三次独立 LLM 调用**，各阶段使用独立提示词模板，避免上下文污染：
+1. 直接翻译：只提供原文 + 词库命中，不提供 API 译文；
+2. 修正：提供原文 + API 译文 + 词库命中；
+3. 最终仲裁：提供原文 + 直接翻译 + 修正结果 + 词库命中，不提供 API 译文；输出最终结果 + 翻译取舍说明 + 8 项审校报告。
+
+### 新增/主要改动
+
+| 文件 | 行号（当前） | 改动内容与作用 |
+|---|---|---|
+| modules/reviewer.py | :55-85、:163-247、:258-330 | 新增三个提示词路径常量与各自占位符集合；`generate_review_bundle` 分三次调用 `_call_llm`；`_generate_mock_bundle`/`_parse_review_bundle` 增加 `tradeoff_notes`；`_parse_review_bundle` 只解析最终仲裁回复（最终结果/取舍说明/审校报告） |
+| modules/reviewer.py | :560-620 | `_review_with_api` 替换为通用 `_call_llm(config, prompt_path, placeholders, replacements)`，复用一次请求完整流程 |
+| prompts/direct_translation_prompt.md | 新增 | 只负责直接翻译；用户消息只有原文 + 词库命中 |
+| prompts/correct_translation_prompt.md | 新增 | 只负责修正；用户消息为原文 + API 译文 + 词库命中 |
+| prompts/review_report_prompt.md | 全文 | 最终仲裁：输出 `## 最终结果` / `## 翻译取舍说明` / `## 审校报告`；用户消息无 API 译文 |
+| app.py | :177-208、:240-345 | 返回结构新增 `tradeoff_notes`（13 键）；`render_results` 增加“翻译取舍说明”展示区 |
+| app.py | :500-520 | LLM 阶段提示改为“正在请求 LLM 多轮处理（直接翻译/修正/最终仲裁/审校）…” |
+| tests/test_reviewer.py | :102-180、:422-475、:890-970 | `_write_template` 改为写三份模板；api 成功/占位符/请求头测试改为 3 次调用；四结果测试改为三段独立响应 |
+| README.md / CLAUDE.md / docs/modules.md | 当前阶段/设计约定/模块说明 | 同步为阶段 3.2 三次独立调用 + 翻译取舍说明 |
+
+### 阶段 3.2 验证
+
+- 全量 `python -m pytest -q`：**105 passed**
+- Playwright 真实 API 模式验证：
+  - 页面出现「翻译结果对比（四个结果）」
+  - 每段显示四个标签：原始 API 译文 / LLM 直接翻译结果 / LLM 修正结果 / LLM 最终结果（以原文为准）
+  - 浏览器控制台无 error / warning
+- `docs/test_report_2026-08-24.md` 已补充四结果展示验证记录
+
+---
+
 ## 远期备选（当前暂缓）：Web 前后端分离重构
 
 > 用户明确指示：**当前先不推进前端重构计划**。此节仅作为远期技术备选记录，不作为下一步执行计划。

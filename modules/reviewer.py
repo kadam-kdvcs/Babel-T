@@ -52,12 +52,20 @@ from modules.settings import (
 # 模块级私有常量
 # ---------------------------------------------------------------------------
 
-# 提示词模板路径：项目根目录 / prompts / review_report_prompt.md
-# （本文件所在目录的上一级即项目根，不依赖启动时的当前目录）
-_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "review_report_prompt.md"
+# 提示词模板目录与三阶段模板路径：
+# - direct_translation_prompt.md：直接翻译原文（不提供 API 译文）
+# - correct_translation_prompt.md：基于“原文 + API 译文”修正
+# - review_report_prompt.md：最终仲裁 + 取舍说明 + 审校报告（不提供 API 译文）
+_PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
+_DIRECT_PROMPT_PATH = _PROMPT_DIR / "direct_translation_prompt.md"
+_CORRECT_PROMPT_PATH = _PROMPT_DIR / "correct_translation_prompt.md"
+_PROMPT_PATH = _PROMPT_DIR / "review_report_prompt.md"  # 保留旧兼容名，实际指最终仲裁模板
 
-# 模板里可替换的 4 个占位符名（写进模板时用花括号包住，如 {source_paragraphs}）
-_PLACEHOLDERS = ("source_paragraphs", "translations", "term_hits", "name_hits")
+# 各阶段模板的占位符（写进模板时用花括号包住，如 {source_paragraphs}）
+_DIRECT_PLACEHOLDERS = ("source_paragraphs", "term_hits", "name_hits")
+_CORRECT_PLACEHOLDERS = ("source_paragraphs", "translations", "term_hits", "name_hits")
+_PLACEHOLDERS = ("source_paragraphs", "direct_translations", "corrected_translations",
+                 "term_hits", "name_hits")
 
 # 模板分隔标记：程序按用户标记拆出用户消息段（占位符所在），
 # 按系统标记截取系统消息段（去掉文件头部的维护者说明）。
@@ -65,10 +73,15 @@ _PLACEHOLDERS = ("source_paragraphs", "translations", "term_hits", "name_hits")
 _USER_SECTION_MARKER = "## 用户消息"
 _SYSTEM_SECTION_MARKER = "## 系统消息"
 
-# LLM 返回内容的结构标记：程序从一次回复中同时提取「纠正后译文」与
-# 「审校报告」两段。若模型没有按这两个标题输出，程序会安全回退——
-# 纠正译文退回原始 API 译文，报告保留整段返回内容（兼容旧版/降级）。
-_CORRECTED_SECTION_MARKER = "## 纠正后译文"
+# LLM 返回内容的结构标记：
+# - 直接翻译响应：`## 直接翻译结果`
+# - 修正响应：`## API译文修正结果`
+# - 最终仲裁响应：`## 最终结果` + `## 翻译取舍说明` + `## 审校报告`
+# 若模型没有按这些标题输出，程序会安全回退。
+_DIRECT_SECTION_MARKER = "## 直接翻译结果"
+_CORRECTED_SECTION_MARKER = "## API译文修正结果"
+_FINAL_SECTION_MARKER = "## 最终结果"
+_TRADEOFF_SECTION_MARKER = "## 翻译取舍说明"
 _REPORT_SECTION_MARKER = "## 审校报告"
 
 # LLM 采样温度：固定 0.3（偏低温，审校任务希望输出稳定、少发散；
@@ -153,25 +166,19 @@ def generate_review_bundle(
     term_hits: list[dict],
     name_hits: list[dict],
 ) -> dict:
-    """生成「审校报告 + LLM 纠正后译文」结果包（双模式入口）。
+    """生成「直接翻译 / 修正 / 最终仲裁 / 审校报告」结果包（双模式入口）。
 
-    作用：一次调用的结果同时包含两个展示所需的数据：
-          - "report"：8 项结构的 markdown 审校报告（延续阶段 3）；
-          - "corrected_translations"：与段落一一对应的 LLM 纠正后译文列表。
-          按配置决定走 mock（占位）还是 api（真实 LLM）：
-          - 空输入（paragraphs 为空）→ 直接返回占位报告与空/原译文列表，
-            api 模式同样不发任何请求（与翻译契约对称）；
-          - engine == "mock"，或 engine == "api" 但缺凭证
-            （has_credentials 为 False）→ 走 _generate_mock_bundle，
-            占位文案与阶段 1 逐字节一致；
-          - engine == "api" 且有凭证 → 读取提示词模板、填入数据、调用 LLM，
-            返回同时含纠正译文与审校报告的结果包。
+    作用：api 模式下分三次独立 LLM 调用，各阶段只携带本阶段必要输入：
+          1. 直接翻译：只输入原文 + 术语/专名命中，**不提供 API 译文**；
+          2. 修正：输入原文 + API 译文 + 术语/专名命中；
+          3. 最终仲裁：输入原文 + 直接翻译 + 修正结果 + 术语/专名命中，
+             不提供 API 译文；输出最终结果 + 翻译取舍说明 + 审校报告。
+          这样避免“直接翻译”受 API 译文上下文污染，也保证各阶段职责单一。
     输入：paragraphs —— list[str]，阿语段落列表；
           translations —— list[str]，与段落一一对应的原始 API 译文列表；
-          term_hits —— list[dict]，术语命中列表；
-          name_hits —— list[dict]，专名命中列表。
-    输出：dict —— 键 "report"（str）与 "corrected_translations"（list[str]）。
-          各列表为空时返回仅含统计数字（0 段、0 条）的占位报告，不报错。
+          term_hits / name_hits —— 术语/专名命中列表。
+    输出：dict —— 含 report / direct_translations / corrected_translations /
+          final_translations / tradeoff_notes。
     异常：api 模式任一阶段失败（网络/业务/解析）抛对应 ReviewError
           子类；模板缺失抛 FileNotFoundError；环境变量非法抛 ValueError。
     """
@@ -186,11 +193,58 @@ def generate_review_bundle(
     if config.engine == MOCK_ENGINE or not config.has_credentials:
         return _generate_mock_bundle(paragraphs, translations, term_hits, name_hits)
 
-    # api 模式：编排「模板 → 数据填充 → 请求 → 解析」全流程；
-    # _review_with_api 返回原始 content，再由 _parse_review_bundle 拆出
-    # 纠正译文与审校报告两段。
-    content = _review_with_api(paragraphs, translations, term_hits, name_hits, config)
-    return _parse_review_bundle(content, paragraphs, translations)
+    # ---- API 模式：三步独立调用 ----
+    hits_text = _format_hits_text(term_hits, name_hits)
+    source_text = _format_numbered(paragraphs, "段")
+
+    # 第一步：直接翻译原文（不含 API 译文）
+    direct_content = _call_llm(
+        config,
+        _DIRECT_PROMPT_PATH,
+        _DIRECT_PLACEHOLDERS,
+        {
+            "source_paragraphs": source_text,
+            "term_hits": hits_text,
+            "name_hits": hits_text,
+        },
+    )
+    direct_translations = _parse_numbered_translations(
+        direct_content, paragraphs, translations
+    )
+
+    # 第二步：基于“原文 + API 译文”修正
+    corrected_content = _call_llm(
+        config,
+        _CORRECT_PROMPT_PATH,
+        _CORRECT_PLACEHOLDERS,
+        {
+            "source_paragraphs": source_text,
+            "translations": _format_numbered(translations, "段译文"),
+            "term_hits": hits_text,
+            "name_hits": hits_text,
+        },
+    )
+    corrected_translations = _parse_numbered_translations(
+        corrected_content, paragraphs, translations
+    )
+
+    # 第三步：最终仲裁 + 取舍说明 + 审校报告（不含 API 译文）
+    final_content = _call_llm(
+        config,
+        _PROMPT_PATH,
+        _PLACEHOLDERS,
+        {
+            "source_paragraphs": source_text,
+            "direct_translations": _format_numbered(direct_translations, "段直接翻译"),
+            "corrected_translations": _format_numbered(corrected_translations, "段修正译文"),
+            "term_hits": hits_text,
+            "name_hits": hits_text,
+        },
+    )
+    bundle = _parse_review_bundle(final_content, paragraphs, corrected_translations)
+    bundle["direct_translations"] = direct_translations
+    bundle["corrected_translations"] = corrected_translations
+    return bundle
 
 
 def _generate_mock_bundle(
@@ -199,63 +253,112 @@ def _generate_mock_bundle(
     term_hits: list[dict],
     name_hits: list[dict],
 ) -> dict:
-    """生成占位版「审校报告 + 纠正译文」（mock / 缺密钥回退；不联网）。
+    """生成占位版「四结果 + 审校报告」（mock / 缺密钥回退；不联网）。
 
-    作用：报告文案与阶段 1 逐字节一致；纠正译文用独立的占位文案，
-          让页面清楚看到“当前不是真实 LLM 纠正”——避免把原始 API
-          译文伪装成 LLM 纠正结果。
+    作用：报告文案与阶段 1 逐字节一致；直接翻译/修正结果/最终结果都用
+          独立占位文案，让页面清楚看到“当前不是真实 LLM 多轮结果”——
+          避免把原始 API 译文伪装成 LLM 结果。
     输入：paragraphs / translations / term_hits / name_hits —— 同公开入口。
-    输出：dict —— {"report": str, "corrected_translations": list[str]}。
+    输出：dict —— 含 report / direct_translations / corrected_translations /
+          final_translations。
     """
     return {
         "report": _generate_mock_report(paragraphs, term_hits, name_hits),
-        "corrected_translations": [
-            f"（占位纠正译文·第{i + 1}段）待接入 LLM 纠正" for i in range(len(paragraphs))
+        "direct_translations": [
+            f"（占位直接翻译·第{i + 1}段）待接入 LLM 直接翻译"
+            for i in range(len(paragraphs))
         ],
+        "corrected_translations": [
+            f"（占位修正译文·第{i + 1}段）待接入 LLM 修正"
+            for i in range(len(paragraphs))
+        ],
+        "final_translations": [
+            f"（占位最终结果·第{i + 1}段）待接入 LLM 仲裁"
+            for i in range(len(paragraphs))
+        ],
+        "tradeoff_notes": "（占位）翻译取舍说明：待接入 LLM 最终仲裁后生成。",
     }
 
 
 def _parse_review_bundle(
-    content: str, paragraphs: list[str], translations: list[str]
+    content: str, paragraphs: list[str], corrected_translations: list[str]
 ) -> dict:
-    """把 LLM 返回内容拆成「纠正后译文 + 审校报告」。
+    """把“最终仲裁”回复拆成 最终结果 / 翻译取舍说明 / 审校报告。
 
-    作用：新版提示词要求 LLM 先输出「## 纠正后译文」再输出
-          「## 审校报告」。本函数优先按这两个二级标题切分；若模型没有
-          按该结构输出（例如旧版模型、只返回报告），则安全回退——
-          纠正译文退回原始 API 译文列表，报告保留整段返回文本。
-          这样页面永远有可展示的数据，不会因格式偏差崩溃。
-    输入：content —— LLM 返回的完整 markdown 文本；
-          paragraphs —— 阿语段落列表（用于校验段数）；
-          translations —— 原始 API 译文列表（解析失败时作为纠正译文兜底）。
-    输出：dict —— {"report": str, "corrected_translations": list[str]}。
+    作用：这就是最终仲裁那一次 LLM 调用的解析函数。它只负责解析：
+          - `## 最终结果`：最终译文列表；
+          - `## 翻译取舍说明`：模型对不同翻译版本取舍和原因；
+          - `## 审校报告`：8 项报告。
+          直接翻译和修正结果已经在各自独立调用中解析完成，所以这里不再
+          解析它们，避免职责混杂。
+    输入：content —— 最终仲裁 LLM 回复全文；
+          paragraphs —— 阿语段落列表；
+          corrected_translations —— 修正结果（最终结果解析失败时兜底）。
+    输出：dict —— 含 report / final_translations / tradeoff_notes。
     """
-    # 两个结构标记必须都存在，否则说明模型没按新版结构输出 → 回退
-    if _CORRECTED_SECTION_MARKER not in content or _REPORT_SECTION_MARKER not in content:
-        return {"report": content.strip(), "corrected_translations": list(translations)}
+    def _section_text(start_marker: str, end_marker: str) -> str | None:
+        """取 start_marker 到 end_marker 之间的文本；缺少标记返回 None。"""
+        if start_marker not in content or (end_marker and end_marker not in content):
+            return None
+        part = content.split(start_marker, 1)[1]
+        if end_marker:
+            part = part.split(end_marker, 1)[0]
+        return part
 
-    # 在「纠正后译文」段与「审校报告」段之间截出纠正译文原始块
-    corrected_part = content.split(_CORRECTED_SECTION_MARKER, 1)[1]
-    corrected_part = corrected_part.split(_REPORT_SECTION_MARKER, 1)[0]
-    corrected_translations = _parse_numbered_translations(corrected_part, paragraphs, translations)
+    # 完全没有最终仲裁结构标记时，整体回退为“旧版单段报告”
+    has_any_section = any(
+        marker in content
+        for marker in (_FINAL_SECTION_MARKER, _TRADEOFF_SECTION_MARKER, _REPORT_SECTION_MARKER)
+    )
+    if not has_any_section:
+        return {
+            "report": content.strip(),
+            "final_translations": list(corrected_translations),
+            "tradeoff_notes": "（缺省）模型未输出翻译取舍说明，请人工复核直接翻译与修正结果。",
+        }
 
-    # 审校报告取「## 审校报告」之后的全部内容并去掉首尾空白
-    report = content.split(_REPORT_SECTION_MARKER, 1)[1].strip()
-    return {"report": report, "corrected_translations": corrected_translations}
+    # 最终结果：在“## 最终结果”到“## 翻译取舍说明”/“## 审校报告”之间
+    final_text = _section_text(_FINAL_SECTION_MARKER, _TRADEOFF_SECTION_MARKER)
+    if final_text is None:
+        final_text = _section_text(_FINAL_SECTION_MARKER, _REPORT_SECTION_MARKER)
+    final_translations = (
+        _parse_numbered_translations(final_text, paragraphs, corrected_translations)
+        if final_text is not None
+        else list(corrected_translations)
+    )
+
+    # 翻译取舍说明：在“## 翻译取舍说明”到“## 审校报告”之间
+    tradeoff_text = _section_text(_TRADEOFF_SECTION_MARKER, _REPORT_SECTION_MARKER)
+    if tradeoff_text is not None:
+        tradeoff_notes = tradeoff_text.strip()
+    else:
+        tradeoff_notes = "（缺省）模型未输出翻译取舍说明，请人工复核直接翻译与修正结果。"
+
+    # 审校报告：取“## 审校报告”之后全部内容
+    if _REPORT_SECTION_MARKER in content:
+        report = content.split(_REPORT_SECTION_MARKER, 1)[1].strip()
+    else:
+        report = content.strip()
+
+    return {
+        "report": report,
+        "final_translations": final_translations,
+        "tradeoff_notes": tradeoff_notes,
+    }
 
 
 def _parse_numbered_translations(
     text: str, paragraphs: list[str], translations: list[str]
 ) -> list[str]:
-    """从「第N段：…」文本中解析出纠正后译文列表。
+    """从「第N段：…」文本中解析出译文列表。
 
-    作用：LLM 输出的纠正译文通常按「第1段：...」逐行列出。这里用正则
+    作用：LLM 输出的每一轮结果通常按「第1段：...」逐行列出。这里用正则
           提取每个「第N段：」到下一个段号/标题之间的内容；若提取到的
-          条数与段落数不一致，则说明模型格式不规范，回退使用原始译文。
-    输入：text —— 「纠正后译文」段内的 markdown 文本；
+          条数与段落数不一致，则说明模型格式不规范，回退使用兜底译文。
+    输入：text —— 某段结果内的 markdown 文本；
           paragraphs —— 阿语段落列表（用于校验数量）；
-          translations —— 原始 API 译文列表（数量不符时兜底）。
-    输出：list[str] —— 与 paragraphs 等长的纠正译文列表。
+          translations —— 兜底译文列表（数量不符时使用）。
+    输出：list[str] —— 与 paragraphs 等长的译文列表。
     """
     # (?s) 让 . 匹配换行；(.*?) 非贪婪；(?=...) 下一条段号或二级标题处截断
     pattern = re.compile(
@@ -266,12 +369,12 @@ def _parse_numbered_translations(
     if len(matches) != len(paragraphs):
         return list(translations)
 
-    corrected = []
+    result = []
     for number_str, segment in matches:
         # 去掉行内常见的 markdown 加粗/斜体标记，保留正文
         clean = re.sub(r"[*_#>`]", "", segment).strip()
-        corrected.append(clean)
-    return corrected
+        result.append(clean)
+    return result
 
 
 def _generate_mock_report(
@@ -299,24 +402,31 @@ def _generate_mock_report(
 # 提示词模板：加载与数据填充
 # ---------------------------------------------------------------------------
 
-def _load_prompt_template() -> str:
+def _load_prompt_template(
+    path: Path | None = None, placeholders: tuple[str, ...] | None = None
+) -> str:
     """读取提示词模板并做结构校验。
 
-    作用：读取 prompts/review_report_prompt.md（UTF-8）并校验结构：
+    作用：读取指定模板（UTF-8）并校验结构：
           - 「## 系统消息」与「## 用户消息」两个分隔标记都必须存在
             （错误消息点名缺哪个），且系统标记在用户标记之前；
-          - 4 个占位符必须全部位于「用户消息段」内且各恰好出现 1 次。
+          - placeholders 指定的占位符必须全部位于「用户消息段」内且各恰好 1 次。
             注意：校验对象是「按用户标记拆出的用户段」而不是全模板——
             若占位符被误挪进系统消息段（或标记位置异常），全模板计数
             仍可能恰好为 1，但实际发给 LLM 的用户消息会残留字面
             占位符或为空。
-    输入：无（读 _PROMPT_PATH 指向的文件）。
+    输入：path —— 模板路径；缺省读 _PROMPT_PATH；placeholders —— 占位符集合。
     输出：str —— 模板全文。
     异常：文件缺失抛 FileNotFoundError（app.py 已捕获，提示数据文件
           缺失）；结构非法抛 ValueError（中文消息，点名缺失的标记）。
     """
+    if path is None:
+        path = _PROMPT_PATH
+    if placeholders is None:
+        placeholders = _PLACEHOLDERS
+
     # 显式 UTF-8 读取（Windows 默认 GBK，模板是中文内容必须显式编码）
-    with open(_PROMPT_PATH, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         template = f.read()
 
     # 两个分隔标记都必须存在：_render_user_message / _review_with_api
@@ -335,7 +445,7 @@ def _load_prompt_template() -> str:
     # str.count(sub) 统计子串出现次数，每个占位符必须恰好 1 次
     # （标记存在已在上方校验，split(…, 1)[1] 必然存在）
     user_section = template.split(_USER_SECTION_MARKER, 1)[1]
-    for name in _PLACEHOLDERS:
+    for name in placeholders:
         if user_section.count(f"{{{name}}}") != 1:
             raise ValueError(
                 f"提示词模板用户消息段中占位符 {name!r} 必须恰好出现 1 次"
@@ -410,22 +520,14 @@ def _format_numbered(items: list[str], label: str) -> str:
     return "\n".join(f"第{i}{label}：{item}" for i, item in enumerate(items, start=1))
 
 
-def _render_user_message(
-    template: str,
-    *,
-    source_paragraphs: str,
-    translations: str,
-    term_hits: str,
-    name_hits: str,
-) -> str:
-    """把提示词模板的用户消息段中的 4 个占位符替换为真实数据。
+def _render_user_message(template: str, replacements: dict[str, str]) -> str:
+    """把提示词模板的用户消息段中的占位符替换为真实数据。
 
     作用：模板以「## 用户消息」为界——前半是系统消息（不替换），
-          后半是用户消息（含 4 个占位符）。本函数只对后半做替换，
+          后半是用户消息（含该模板声明的占位符）。本函数只对后半做替换，
           返回替换后的用户消息文本。
-    输入：template —— 模板全文；source_paragraphs / translations ——
-          编号化后的段落/译文文本；term_hits / name_hits —— 格式化后的
-          术语/专名命中清单文本。
+    输入：template —— 模板全文；replacements —— 形如
+          {"source_paragraphs": "…", "translations": "…"} 的替换字典。
     输出：str —— 替换完成后的用户消息文本。
     异常：模板中找不到「## 用户消息」标记时抛 ValueError。
     """
@@ -435,16 +537,11 @@ def _render_user_message(
         raise ValueError("提示词模板缺少「## 用户消息」标记")
     user_section = parts[1]
 
-    # 4 个占位符逐一做纯文本替换。刻意用 str.replace 而不用 format：
+    # 每个占位符逐一做纯文本替换。刻意用 str.replace 而不用 format：
     # 模板正文里可能含有中文括号「（」「）」等字符，format 语法会把
     # 花括号内容当作格式字段解析（如 {（} 会直接报错），replace 是
     # 逐字节的纯文本替换，对模板内容零约束。
-    for name, text in (
-        ("source_paragraphs", source_paragraphs),
-        ("translations", translations),
-        ("term_hits", term_hits),
-        ("name_hits", name_hits),
-    ):
+    for name, text in replacements.items():
         # f"{{{name}}}" 生成 "{name}" 字面量（花括号本身也是替换目标）
         user_section = user_section.replace(f"{{{name}}}", text)
     return user_section
@@ -490,55 +587,39 @@ def _build_request_payload(
     }
 
 
-def _review_with_api(
-    paragraphs: list[str],
-    translations: list[str],
-    term_hits: list[dict],
-    name_hits: list[dict],
+def _call_llm(
     config: ReviewConfig,
+    prompt_path: Path,
+    placeholders: tuple[str, ...],
+    replacements: dict[str, str],
 ) -> str:
-    """执行一次完整的 LLM 审校请求（api 模式核心编排）。
+    """执行一次独立的 LLM 调用（阶段 3.2 各阶段共用）。
 
-    作用：按「读模板 → 拆系统/用户段 → 格式化数据 → 替换占位符 →
-          构造请求 → POST → 解析响应」的顺序完成一次审校调用。
-    输入：paragraphs / translations / term_hits / name_hits —— 审校数据；
-          config —— 审校配置（提供 api_key / api_url / model / timeout）。
-    输出：str —— LLM 生成的审校报告文本（markdown）。
+    作用：按「读模板 → 拆系统/用户段 → 替换占位符 → 构造请求 → POST →
+          → 解析响应」完成一次 LLM 调用。每个阶段传入自己的模板、占位符
+          和替换数据，确保“直接翻译”阶段不会收到 API 译文等非本阶段输入。
+    输入：config —— 审校配置；prompt_path —— 该阶段模板路径；
+          placeholders —— 该模板的占位符集合；replacements —— 占位符替换字典。
+    输出：str —— LLM 返回的原始 markdown 文本。
     异常：超时/连接失败 → ReviewNetworkError；HTTP 非 200 →
           ReviewBusinessError（附状态码与响应片段）；解析失败 →
           ReviewParseError；以上消息全部中文且不含密钥。
     """
-    # 1. 读取提示词模板（缺失 → FileNotFoundError；结构非法 → ValueError）
-    template = _load_prompt_template()
+    # 1. 读取本阶段模板（缺失 → FileNotFoundError；结构非法 → ValueError）
+    template = _load_prompt_template(prompt_path, placeholders)
 
-    # 2. 拆系统消息段：先按用户标记切掉「用户消息」部分，再在剩余部分
-    #    按系统标记截到标记之后——文件头部（标题行 + 维护者说明
-    #    blockquote）在系统标记之前，是给人看的说明文字，不应随系统
-    #    消息发给 LLM（提示词噪音）；保留「## 系统消息」标题本身无妨，
-    #    LLM 能理解这是系统消息段的标题。
-    #    （两个标记的存在与先后顺序已由 _load_prompt_template 校验）
+    # 2. 拆系统消息段：截到「## 系统消息」标记之后；模板头部说明不发给 LLM
     system_part = template.split(_USER_SECTION_MARKER)[0]
     system_message = system_part.split(_SYSTEM_SECTION_MARKER, 1)[1].strip()
 
-    # 3. 数据格式化：段落/译文编号化（LLM 引用段号用）；
-    #    术语与专名命中统一清单（两节合并为一段文本，同时填入模板里
-    #    相邻的两个命中占位符）
-    hits_text = _format_hits_text(term_hits, name_hits)
-    user_message = _render_user_message(
-        template,
-        source_paragraphs=_format_numbered(paragraphs, "段"),
-        translations=_format_numbered(translations, "段译文"),
-        term_hits=hits_text,
-        name_hits=hits_text,
-    )
+    # 3. 只替换本阶段模板声明的占位符
+    user_message = _render_user_message(template, replacements)
 
     # 4. 构造请求：URL（base + /chat/completions）与请求体
     url = _build_api_url(config)
     payload = _build_request_payload(config, system_message, user_message)
 
-    # 5. 发送请求。密钥只放在 Authorization 请求头里（Bearer 前缀是
-    #    OpenAI 兼容接口的通行认证写法），绝不进请求体；
-    #    timeout 来自配置（防请求挂死）
+    # 5. 发送请求。密钥只放在 Authorization 请求头里；timeout 来自配置
     try:
         response = requests.post(
             url,
@@ -550,17 +631,13 @@ def _review_with_api(
             timeout=config.timeout_seconds,
         )
     except requests.exceptions.Timeout as e:
-        # 超时：requests 把读超时/连超时都归入 Timeout 异常
         raise ReviewNetworkError(
             f"审校请求超时（{config.timeout_seconds} 秒）"
         ) from e
     except requests.exceptions.RequestException as e:
-        # 连接失败（DNS/拒连/断线等）：错误消息只带原因，绝不含密钥
         raise ReviewNetworkError(f"审校请求连接失败：{e}") from e
 
     # 6. HTTP 状态码非 200 视为业务层失败：带状态码与响应文本片段
-    #    （截断前 200 字符），便于排查；异常消息不含我们自己的密钥
-    #    （密钥只在请求头里，不会出现在响应文本中）
     if response.status_code != 200:
         snippet = (response.text or "")[:200]
         raise ReviewBusinessError(
@@ -569,7 +646,7 @@ def _review_with_api(
             snippet=snippet,
         )
 
-    # 7. 解析成功响应（200）：格式错误在 _parse_review_response 内转异常
+    # 7. 解析成功响应
     return _parse_review_response(response)
 
 

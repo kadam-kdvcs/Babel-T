@@ -52,7 +52,7 @@ docs/                       # meeting_notes.md 决策记录、modules.md 模块�
 - **session_state**：只用 1 个键 "results" 存结果，防止按钮后重跑丢失
 - **翻译双模式（阶段 2）**：环境变量 `TRANSLATION_ENGINE` = mock（占位，默认）/ api（调阿里云）；api 缺密钥自动回退占位 + 页面黄色提示，不报错；`translate_paragraphs` 是串行兼容入口，`translate_paragraphs_parallel` 是并发入口（ThreadPoolExecutor 默认 4 线程）供 Streamlit 动态展示；任一段失败抛异常（异常带段号）；术语/专名约束 `build_translation_constraints` **生成但不发送**（阿里云 TranslateGeneral 无 context 参数，payload 留 `params["Context"]` 注释位）；dotenv 只在 app.py 顶部加载一次，modules/ 不 import dotenv
 - **配置集中管理（阶段 2 重构）**：翻译配置（环境变量名 `ENV_*` / 默认值 `DEFAULT_*` / 引擎标识 / `TranslationConfig` / `load_translation_config`）集中在 `modules/settings.py`，`translator.py` 只保留翻译逻辑；引用方**显式从正确模块导入**——配置符号从 settings 取，翻译符号（`translate_paragraphs` / `TranslationError` 家族）从 translator 取（异常刻意留 translator：错误是翻译行为的对外契约）；改配置只动 settings.py；环境变量值 strip、空串=未设置=默认值
-- **审校双模式（阶段 3 / 3.1）**：环境变量 `REVIEW_ENGINE` = mock（占位报告，默认，与阶段 1 文案逐字节一致）/ api（调 DeepSeek OpenAI 兼容接口，读取 `prompts/review_report_prompt.md` 模板，`generate_review_bundle` 一次调用同时返回 `report` 与 `corrected_translations`——逐段 LLM 纠正后译文 + 8 项 markdown 报告）；`generate_review_report` 是兼容旧调用的薄包装（取返回包里的 `report`）；LLM 配置（`ReviewConfig` / `load_review_config` / `REVIEW_*`、`DEEPSEEK_*` 常量）同在 settings.py；api 缺 key 自动回退占位 + 页面黄条（`review_fallback` 标记）不报错；调用失败（网络/业务/解析）抛 `reviewer.ReviewError` 家族（异常刻意留 reviewer）→ 页面红条、旧结果保留（api 翻译结果不丢）；`DEEPSEEK_API_URL` 是 base URL（默认 https://api.deepseek.com，内部拼 /chat/completions）；temperature 固定 0.3；**LLM 是校准辅助**：翻译 API 无法接入术语表，术语一致性靠 LLM 把关——翻译与审校都执行；页面「翻译结果展示」radio 可切换「显示 LLM 纠正过后的翻译 / 显示原始 API 翻译 + LLM 纠正过后的翻译结果（两者都显示）」视图（只影响展示，不影响流水线执行），审校报告保留在下方
+- **审校多结果（阶段 3 / 3.1 / 3.2）**：环境变量 `REVIEW_ENGINE` = mock（占位，默认）/ api（调 DeepSeek OpenAI 兼容接口，读取 `prompts/` 下 **三个独立模板**：`direct_translation_prompt.md` / `correct_translation_prompt.md` / `review_report_prompt.md`，`generate_review_bundle` **分三次独立调用**，各阶段只带必要输入（直接翻译不带 API 译文、最终仲裁不带 API 译文），返回 `report` + `direct_translations` + `corrected_translations` + `final_translations` + `tradeoff_notes`）；`generate_review_report` 是兼容旧调用的薄包装（取返回包里的 `report`）；LLM 配置（`ReviewConfig` / `load_review_config` / `REVIEW_*`、`DEEPSEEK_*` 常量）同在 settings.py；api 缺 key 自动回退占位 + 页面黄条（`review_fallback` 标记）不报错；调用失败（网络/业务/解析）抛 `reviewer.ReviewError` 家族（异常刻意留 reviewer）→ 页面红条、旧结果保留（api 翻译结果不丢）；`DEEPSEEK_API_URL` 是 base URL（默认 https://api.deepseek.com，内部拼 /chat/completions）；temperature 固定 0.3；**最终仲裁以原文为最高依据，禁止添加原文未有的信息**；页面固定显示四个结果对比 + 翻译取舍说明，审校报告保留在下方
 
 ## 开发规则（团队约定，必须遵守）
 
@@ -63,14 +63,15 @@ docs/                       # meeting_notes.md 决策记录、modules.md 模块�
 5. 需求不清楚先向用户提问，不擅自改技术路线
 6. 分阶段目标参见 README.md「路线图」
 
-## 当前阶段（第 3.1 阶段）已确认的决策
+## 当前阶段（第 3.2 阶段）已确认的决策
 
 - 翻译引擎：requests 手写阿里云 RPC 签名（不引 SDK）；mock/api 双模式由环境变量切换
 - 缺 key 回退占位（页面黄色提示），不崩溃；翻译失败（网络/业务/解析）中断整批并显示错误，旧结果保留
-- LLM 审校：DeepSeek OpenAI 兼容接口（requests 直调，不引 openai SDK）；REVIEW_ENGINE=mock/api 双模式；api 缺 key 回退占位 + 黄条；调用失败抛 ReviewError 家族（页面红条、旧结果保留）
-- LLM 纠正：`generate_review_bundle` 一次调用同时返回 `corrected_translations` 与 `report`；提示词要求先输出 `## 纠正后译文` 再输出 `## 审校报告`
+- LLM 多结果：DeepSeek OpenAI 兼容接口（requests 直调，不引 openai SDK）；REVIEW_ENGINE=mock/api 双模式；api 缺 key 回退占位 + 黄条；调用失败抛 ReviewError 家族（页面红条、旧结果保留）
+- LLM 三轮处理：**三次独立调用**，每次使用独立提示词模板；直接翻译上下文不提供 API 译文，最终仲裁上下文不提供 API 译文；输出：`## 直接翻译结果` / `## API译文修正结果` / `## 最终结果` / `## 翻译取舍说明` / `## 审校报告`
+- 最终仲裁以原文为最高依据，禁止添加原文未有的信息
 - 审校报告 8 项结构（文本概况/术语命中与风险/专名命中与统一性/重点风险句段/语体与领域适配/文化政治语境提醒/总体结论/人工复核建议）；模板以「## 用户消息」为系统/用户消息分界；占位符校验针对用户段
-- LLM 定位：校准辅助（翻译 API 无法接入术语表，术语一致性靠 LLM 把关）；翻译与审校都执行；页面「翻译结果展示」radio 只切换「仅纠正译文 / 原始+纠正译文」两种翻译视图
+- 页面固定显示四结果对比：原始 API 译文 / LLM 直接翻译 / LLM 修正结果 / LLM 最终结果，并展示翻译取舍说明
 - 安全：真实密钥仅放本地 .env（gitignored），绝不进代码/README/测试/日志
 
-阶段 1/2/3/3.1 已全部完成（本地流水线 + 双模式翻译 + LLM 纠正与审校 + 105 测试 + 文档）。详细决策见 docs/meeting_notes.md。
+阶段 1/2/3/3.1/3.2 已全部完成（本地流水线 + 双模式翻译 + LLM 多结果仲裁与审校 + 105 测试 + 文档）。详细决策见 docs/meeting_notes.md。

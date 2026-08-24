@@ -122,20 +122,20 @@ api 模式缺密钥时自动回退占位（不抛错）；任一段翻译失败�
 
 ---
 
-## modules/reviewer.py — 审校报告 + LLM 纠正译文（阶段 3 / 3.1 双模式）
+## modules/reviewer.py — 四结果 + 审校报告（阶段 3 / 3.1 / 3.2 多结果）
 
-**作用**：生成「审校报告 + LLM 纠正后译文」结果包。双模式由环境变量 `REVIEW_ENGINE` 决定：
-`mock`（占位报告/占位纠正译文，不联网，默认，报告文案与阶段 1 逐字节一致）/ `api`（读取
-prompts/review_report_prompt.md 模板，调用 DeepSeek / OpenAI 兼容接口，一次回复同时输出
-逐段纠正后译文与 8 项结构报告）。
+**作用**：生成「直接翻译 + 修正结果 + 最终仲裁 + 审校报告」结果包。双模式由环境变量 `REVIEW_ENGINE` 决定：
+`mock`（占位, 不联网，默认，报告文案与阶段 1 逐字节一致）/ `api`（调用 DeepSeek / OpenAI 兼容接口，
+**分三次独立调用**，每次使用独立提示词模板）：
+①直接翻译原文（不提供 API 译文）；②基于原文 + API 译文修正；③结合原文仲裁最终结果 + 翻译取舍说明 + 8 项报告（不提供 API 译文）。
 api 模式缺密钥时自动回退占位（不抛错）；调用失败（网络/业务/解析）抛 `ReviewError` 家族。
-LLM 是校准辅助：翻译 API 无法接入术语表，术语一致性由 LLM 依据术语库把关。
+最终仲裁以原文为最高依据，禁止添加原文未有的信息。
 
 **公开函数**：
 
 | 函数 | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| `generate_review_bundle(paragraphs, translations, term_hits, name_hits)` | 段落、原始译文、两类命中列表 | `dict`：`{"report": str, "corrected_translations": list[str]}` | 一次调用同时拿到审校报告与纠正后译文。空输入短路 → 占位（api 也不发请求）；mock 或缺 key → 占位（报告逐字节一致）；否则 api 调 LLM 并解析两段结构 |
+| `generate_review_bundle(paragraphs, translations, term_hits, name_hits)` | 段落、原始 API 译文、两类命中列表 | `dict`：`{"report": str, "direct_translations": list[str], "corrected_translations": list[str], "final_translations": list[str], "tradeoff_notes": str}` | 三次独立调用，各阶段只带必要输入。空输入短路 → 占位（api 也不发请求）；mock 或缺 key → 占位；否则依次调用直接翻译 / 修正 / 最终仲裁 |
 | `generate_review_report(...)` | 同上 | `str` 报告文本 | 兼容旧调用的薄包装：调用 `generate_review_bundle` 后只返回 `"report"` |
 
 **异常体系**（定义在本模块，消息全中文、不含密钥）：
@@ -145,22 +145,24 @@ LLM 是校准辅助：翻译 API 无法接入术语表，术语一致性由 LLM 
 - `ReviewParseError`：响应非 JSON / 缺 choices / 缺 message.content
 
 **私有函数**（纯函数，可单测）：
-- `_generate_mock_bundle(...)`：mock/缺 key 时返回占位报告 + 占位纠正译文列表
-- `_parse_review_bundle(content, paragraphs, translations)`：从 LLM 回复中按 `## 纠正后译文` / `## 审校报告` 两个二级标题拆出纠正译文与报告；模型未按此结构输出时安全回退（纠正译文=原始译文、报告=整段文本）
-- `_parse_numbered_translations(text, paragraphs, translations)`：从「第N段：…」文本解析纠正译文；提取条数与段落数不符时回退原始译文
-- `_load_prompt_template()`：读模板（UTF-8）；缺文件抛 FileNotFoundError；结构校验——「## 系统消息」「## 用户消息」两个标记都存在且顺序正确，且 4 个占位符（source_paragraphs / translations / term_hits / name_hits）在**用户段**各恰好 1 次，否则中文 ValueError
+- `_generate_mock_bundle(...)`：mock/缺 key 时返回占位报告 + 占位直接翻译/修正/最终结果 + 占位取舍说明
+- `_parse_review_bundle(content, paragraphs, corrected_translations)`：解析“最终仲裁”回复，按 `## 最终结果` / `## 翻译取舍说明` / `## 审校报告` 三个二级标题拆出最终译文、取舍说明与报告；未按结构输出时安全回退
+- `_parse_numbered_translations(text, paragraphs, fallback)`：从「第N段：…」文本解析某轮译文；提取条数与段落数不符时回退传入的兜底列表
+- `_load_prompt_template(path=None, placeholders=None)`：读指定模板（UTF-8）；缺文件抛 FileNotFoundError；结构校验——「## 系统消息」「## 用户消息」两个标记都存在且顺序正确，且 placeholders 指定的占位符在**用户段**各恰好 1 次
 - `_format_hits_text(term_hits, name_hits)`：两库统一格式化（.get 兼容键差异，专名无「领域」「处理方式」）：`【术语命中】共 N 条\n- 阿语原文「…」→ 中文译文「…」（类别：…；领域：…；备注：…；处理方式：…；出现段落：1, 4, 5；出现次数：7）`；无命中输出「无」；处理方式保留 CSV 原值（语义说明在模板）
 - `_format_numbered(items, label)`：段落/译文编号化「第N段：…」，LLM 可引用段号
-- `_render_user_message(template, ...)`：按「## 用户消息」split，只对用户段做 4 次 `str.replace`（用 replace 不用 format：对模板中文括号零约束）；系统段截到「## 系统消息」标记之后（模板头部维护者说明不发给 LLM）
+- `_render_user_message(template, replacements)`：按「## 用户消息」split，只对用户段做 `replacements` 中占位符的 `str.replace`；系统段截到「## 系统消息」标记之后
+- `_call_llm(config, prompt_path, placeholders, replacements)`：执行一次独立 LLM 调用（读模板 → 拆段 → 替换 → POST → 解析），POST 带 `Authorization: Bearer <key>` 与 `Content-Type: application/json`，timeout 来自配置
 - `_build_api_url(config)`：`config.api_url.rstrip("/") + "/chat/completions"`（去重尾斜杠）
 - `_build_request_payload(config, system, user)`：`{"model", "messages": [{role: system}, {role: user}], "temperature": 0.3}`
-- `_review_with_api(...)`：编排（模板 → 拆分 → 格式化 → 替换 → POST → 解析）；POST 带 `Authorization: Bearer <key>` 与 `Content-Type: application/json`，timeout 来自配置
 - `_parse_review_response(response)`：超时/连接失败 → Network；HTTP 非 200 → Business（状态码 + text[:200]）；非 JSON / 缺 choices / 缺 message.content → Parse；成功返回 content
 
-**模板文件**（prompts/review_report_prompt.md）：以「## 用户消息」为系统/用户消息分界；
-系统消息含角色设定、两段输出结构（`## 纠正后译文` + `## 审校报告` 8 项）、3 条约束
-（在给定译文基础上修正、不添加原文没有的信息、术语以术语库为准）；
-用户消息含 4 个占位符，由 reviewer 运行时替换。
+**模板文件**（prompts/ 目录下三份）：
+- `direct_translation_prompt.md`：直接翻译阶段，占位符 source/term/name，不包含 API 译文
+- `correct_translation_prompt.md`：修正阶段，占位符 source/translations/term/name
+- `review_report_prompt.md`：最终仲裁阶段，输出 `## 最终结果` / `## 翻译取舍说明` / `## 审校报告`，占位符 source/direct/corrected/term/name，不包含 API 译文
+
+每个模板都以「## 用户消息」为系统/用户消息分界；系统消息含角色设定、输出结构、约束。
 
 **调用方**：app.py 的 `run_pipeline`。环境变量与默认值见 modules/settings.py 节。
 
@@ -182,24 +184,23 @@ LLM 是校准辅助：翻译 API 无法接入术语表，术语一致性由 LLM 
 
 | 函数 | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| `run_pipeline(text: str)` | 整篇阿语文本 | `dict`（10 键：paragraphs/translations/corrected_translations/term_hits/name_hits/report/translation_mode/translation_fallback/review_mode/review_fallback） | 完整入口（无 UI 回调），内部委托 `run_pipeline_progressive`；corrected_translations 为 LLM 纠正后译文列表；translation_mode/translation_fallback 为翻译本次生效模式与「api 缺密钥回退占位」标志，review_mode/review_fallback 为审校的对应两键 |
+| `run_pipeline(text: str)` | 整篇阿语文本 | `dict`（13 键：paragraphs/translations/direct_translations/corrected_translations/final_translations/tradeoff_notes/term_hits/name_hits/report/translation_mode/translation_fallback/review_mode/review_fallback） | 完整入口（无 UI 回调），内部委托 `run_pipeline_progressive`；三个 LLM 列表分别为直接翻译/修正结果/最终结果；tradeoff_notes 为翻译取舍说明；translation_mode/review_mode 等为模式与回退标志 |
 | `run_pipeline_progressive(text, *, on_paragraphs=None, on_translation=None, on_review_start=None, on_review_done=None)` | 整篇阿语文本 + 可选回调 | `dict`（同上） | 渐进式流水线：切分完成回调、每段翻译完成回调、LLM 开始/完成回调；页面用它实现“等待翻译→翻译完成→LLM 审校中”的动态展示 |
 | `_load_sample()` | 无 | `str` | 读取 data/samples/politics_001.txt 预填输入框 |
 | `_hits_to_rows(hits, columns)` | 命中列表 + 要展示的列 | `list[dict]` 展示行 | 统一列序，供 st.dataframe 渲染 |
-| `render_results(results, show_corrected_only=False)` | run_pipeline 的结果 dict | 无（直接渲染页面） | 渲染「翻译对照/术语命中/专名命中/审校报告」；`show_corrected_only=True` 只显示 LLM 纠正后译文，`False` 同时显示原始 API 译文与 LLM 纠正后译文 |
+| `render_results(results)` | run_pipeline 的结果 dict | 无（直接渲染页面） | 渲染「四结果对比/术语命中/专名命中/审校报告」；四结果固定展示：原始 API 译文、LLM 直接翻译、LLM 修正结果、LLM 最终结果 |
 
-**页面布局**：标题 → 阿语输入框（预填样例）→ 「开始翻译与审校」按钮 → 翻译结果展示 radio → 翻译对照（阿语 RTL 右对齐；默认同时显示原始 API 译文与 LLM 纠正后译文）→ 术语命中表（六列）→ 专名命中表（四列）→ 审校报告区。
+**页面布局**：标题 → 阿语输入框（预填样例）→ 「开始翻译与审校」按钮 → 四结果对比（阿语 RTL 右对齐；固定展示原始 API 译文 / LLM 直接翻译 / LLM 修正结果 / LLM 最终结果）→ 翻译取舍说明 → 术语命中表（六列）→ 专名命中表（四列）→ 审校报告区。
 
 **关键实现**：
 - 顶部 `load_dotenv(BASE_DIR / ".env")` 加载本地密钥（全项目唯一 import dotenv 处）
 - 结果存 `st.session_state["results"]`，防止按钮后重跑丢失；异常时不覆盖 → 旧结果保留
-- 按钮点击后使用 `run_pipeline_progressive`：先按段落创建 `st.empty` 占位符，**原文立即显示**，译文位置显示“等待翻译…”；某段并发翻译完成后立刻在该段原文下方补充译文；全部翻译完成后显示“正在请求 LLM 纠正与审校…”，LLM 返回后清空临时占位符并渲染完整结果区
+- 按钮点击后使用 `run_pipeline_progressive`：先按段落创建 `st.empty` 占位符，**原文立即显示**，译文位置显示“等待翻译…”；某段并发翻译完成后立刻在该段原文下方补充译文；全部翻译完成后显示“正在请求 LLM 多轮处理…”，LLM 返回后清空临时占位符并渲染完整结果区
 - RTL 用独立 CSS class `.ar-para`，只影响阿语区域
 - 用户文本先 `html.escape` 再拼 HTML，防注入
 - 处理方式列做显示映射：force_check→强检查、suggest→推荐检查、context_warning→语境检查
 - 异常捕获（按业务发生顺序）：FileNotFoundError（数据缺失）→ st.error；translator.TranslationError（翻译失败，消息含段号）→ st.error；reviewer.ReviewError（审校失败）→ st.error；ValueError（配置错误）→ st.error
 - fallback 为真时结果区顶部 st.warning「已配置 API 模式但未配置密钥…」/「已配置 LLM 校准 API 模式但未配置密钥…」；译文标签随模式变化（api 真实译文不带「占位」字样）
-- 翻译结果展示 radio（key="review_view"，默认全量视图）：「显示 LLM 纠正过后的翻译 / 显示原始 API 翻译 + LLM 纠正过后的翻译结果（两者都显示）」；**只影响渲染，翻译/纠正/审校照常执行**
 - 报告区：api 真报告 → st.markdown（LLM 输出是 markdown，**不传 unsafe_allow_html** 防注入）+ caption 提示供人工复核；mock/回退 → st.info 占位样式
 
 **调用方**：无（页面入口，运行 `streamlit run app.py`）。
@@ -213,7 +214,7 @@ LLM 是校准辅助：翻译 API 无法接入术语表，术语一致性由 LLM 
 | test_segmenter.py | 切分规则全边界（空/纯空白/无空行/空行分组/Windows 换行/段内换行） |
 | test_glossary.py | 归一化四类字符、防过度归一化；加载（六列/四列/BOM/缺文件/空行/引号）；扫描（变体拼写/段号/次数/多词/纯子串/空输入） |
 | test_translator.py | 阶段 1 保留 3 条（长度一致、含标记、空输入）+ 阶段 2 新增 26 条：配置 4、签名 4、payload 3、双模式 6、约束 3、错误路径 6；阶段 3.1 新增 2 条：并发入口全段落翻译+回调、并发入口 mock 不联网 |
-| test_reviewer.py | 阶段 1 保留 3 条（统计数字、占位标记、返回类型）+ 阶段 3 新增 26 条（配置/双模式/模板/hits/请求/错误路径）+ 阶段 3.1 新增 4 条：结果包 mock 占位、api 解析纠正译文与报告、无结构标记回退、纠正段数不符回退 |
+| test_reviewer.py | 阶段 1 保留 3 条（统计数字、占位标记、返回类型）+ 阶段 3 新增 26 条（配置/双模式/模板/hits/请求/错误路径）+ 阶段 3.1/3.2 新增 4 条：四结果 mock 占位、api 解析四结果、无结构标记回退、最终结果段数不符回退 |
 | test_data_integrity.py | 数据文件可加载且条数达标、样例文本切分段数（可选） |
 
 运行：项目根目录 `python -m pytest -v`。

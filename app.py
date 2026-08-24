@@ -1,26 +1,24 @@
-"""Streamlit 页面入口（第 3.1 阶段）：阿拉伯语翻译审校助手 MVP。
+"""Streamlit 页面入口（第 3.2 阶段）：阿拉伯语翻译审校助手 MVP。
 
 页面布局：
 1. 标题与说明
 2. 阿语文本输入框（预填示例文本）
 3. 「开始翻译与审校」按钮
-4. 翻译结果展示 radio（仅 LLM 纠正译文 / 原始 API + LLM 纠正译文）
-5. 展示区：翻译对照 / 术语命中 / 专名命中 / 审校报告
+4. 展示区：四结果对比 / 术语命中 / 专名命中 / 审校报告
 
 翻译双模式（阶段 2）：默认 mock（占位译文，不联网）；配置阿里云
 密钥后走 api（真实翻译）。api 缺密钥时自动回退占位译文并提示。
 
-审校双模式（阶段 3 / 3.1）：默认 mock（占位报告与占位纠正译文，
-不联网）；配置 DeepSeek 密钥后走 api（LLM 审校，读取
-prompts/review_report_prompt.md 提示词模板，一次调用同时返回
-逐段纠正后译文与 8 项审校报告）。api 缺密钥时自动回退占位并提示。
-任一异常时页面提示错误、保留上次成功结果（翻译结果不丢）。
+LLM 多结果（阶段 3 / 3.1 / 3.2）：默认 mock（占位，不联网）；
+配置 DeepSeek 密钥后走 api（读取 prompts/ 下三份独立模板，分三次
+独立调用：直接翻译原文（不带 API 译文）、基于 API 译文修正、
+结合原文仲裁最终结果并输出取舍说明与 8 项审校报告）。
+最终仲裁以原文为最高依据，禁止添加原文未有的信息。api 缺密钥时
+自动回退占位并提示。任一异常时页面提示错误、保留上次成功结果（翻译结果不丢）。
 
-翻译结果展示视图（阶段 3.1）：页面提供 st.radio 切换「显示 LLM
-纠正过后的翻译」与「显示原始 API 翻译 + LLM 纠正过后的翻译结果
-（两者都显示）」两种视图——该控件只影响展示区内容，不影响
-run_pipeline 的执行：翻译、LLM 纠正与审校照常运行（API 机器翻译是
-不可省略的主步骤，LLM 校准辅助，二者缺一不可）。
+四结果对比（阶段 3.2）：页面固定显示四个翻译结果——原始 API 译文、
+LLM 直接翻译结果、LLM 修正结果、LLM 最终结果（以原文为准），
+术语/专名命中表与审校报告始终保留。
 
 本文件是唯一包含 UI 的模块；流水线逻辑集中在 run_pipeline()，
 不依赖页面状态，可在命令行直接调用验证。
@@ -66,12 +64,10 @@ TERM_COLUMNS = ["阿语原文", "中文译文", "类别", "领域", "备注", "�
 # 专名命中表要展示的列（proper_names.csv 四列表头 + 扫描补充的两列）
 NAME_COLUMNS = ["阿语原文", "中文译文", "类别", "备注", "段落", "出现次数"]
 
-# 翻译展示视图的两个选项文案（st.radio 的两个选项）。
-# 比较视图时用这两个常量而不是手写字符串：选项文案一旦改动，只需改
-# 这里一处，避免「选项文案改了、比较处的字面量没同步」导致视图判断
-# 永远出错。
-VIEW_CORRECTED_ONLY = "显示 LLM 纠正过后的翻译"
-VIEW_RAW_AND_CORRECTED = "显示原始 API 翻译 + LLM 纠正过后的翻译结果（两者都显示）"
+# 页面展示结果为“四结果固定对比”：原始 API 译文 / LLM 直接翻译 /
+# LLM 基于 API 译文修正 / LLM 最终仲裁结果。保留常量位供未来如需
+# 切换视图时使用。
+VIEW_COMPARISON = "四结果对比"
 
 
 def _load_sample() -> str:
@@ -121,7 +117,10 @@ def run_pipeline_progressive(
     输出：dict —— 键：
           paragraphs           阿语段落列表
           translations         原始 API 译文列表（占位或真实翻译）
-          corrected_translations LLM 纠正后译文列表（占位或真实纠正）
+          direct_translations  LLM 直接翻译原文的结果列表
+          corrected_translations LLM 基于 API 译文修正后的结果列表
+          final_translations   LLM 结合原文/直接/修正后的最终仲裁结果列表
+          tradeoff_notes       LLM 对直接翻译与修正结果的取舍说明
           term_hits            术语命中列表
           name_hits            专名命中列表
           report               审校报告字符串（占位或 LLM 生成）
@@ -168,8 +167,8 @@ def run_pipeline_progressive(
     if on_review_start is not None:
         on_review_start()
 
-    # 审校结果包（阶段 3.1：一次调用同时拿到「审校报告」与「LLM 纠正后译文」；
-    # mock 或缺密钥时两者都是占位数据，由页面黄色提示告知用户）
+    # 审校结果包（阶段 3.2：三次独立调用拿到「直接翻译 / 修正结果 / 最终结果 /
+    # 取舍说明 / 审校报告」；mock 或缺密钥时均为占位数据，由页面黄色提示告知用户）
     review_result = reviewer.generate_review_bundle(
         paragraphs, translations, term_hits, name_hits
     )
@@ -177,7 +176,10 @@ def run_pipeline_progressive(
         on_review_done(review_result)
 
     report = review_result["report"]
+    direct_translations = review_result["direct_translations"]
     corrected_translations = review_result["corrected_translations"]
+    final_translations = review_result["final_translations"]
+    tradeoff_notes = review_result.get("tradeoff_notes", "")
 
     # 读取本次生效的审校配置，确定「模式」与「是否回退占位」两个展示键
     # （与上方翻译配置块对称：页面直接读这两个键渲染提示，不在 UI 层
@@ -191,7 +193,10 @@ def run_pipeline_progressive(
     return {
         "paragraphs": paragraphs,
         "translations": translations,
+        "direct_translations": direct_translations,
         "corrected_translations": corrected_translations,
+        "final_translations": final_translations,
+        "tradeoff_notes": tradeoff_notes,
         "term_hits": term_hits,
         "name_hits": name_hits,
         "report": report,
@@ -231,18 +236,17 @@ def _hits_to_rows(hits: list[dict], columns: list[str]) -> list[dict]:
     return rows
 
 
-def render_results(results: dict, show_corrected_only: bool = False) -> None:
-    """渲染结果展示区（翻译对照 / 术语命中 / 专名命中 / 审校报告）。
+def render_results(results: dict) -> None:
+    """渲染结果展示区（四结果对比 / 术语命中 / 专名命中 / 审校报告）。
 
-    作用：把 run_pipeline 的结果渲染到页面。翻译对照区提供两种视图：
-          - show_corrected_only=False（默认）：同一段同时显示「原始 API
-            译文」与「LLM 纠正后译文」，方便对比；
-          - show_corrected_only=True：只显示「LLM 纠正后译文」，页面更简洁。
-          该参数只影响展示，不影响 run_pipeline 的执行。审校报告作为
-          辅助信息始终保留在下方。
-    输入：results —— run_pipeline 的输出 dict；
-          show_corrected_only —— True 时隐藏原始 API 译文，只显示 LLM
-          纠正后译文；False 时两者都显示。
+    作用：把 run_pipeline 的结果渲染到页面。翻译结果对比区固定展示四个结果：
+          1. 原始 API 译文
+          2. LLM 直接翻译原文的结果
+          3. LLM 基于 API 译文修正后的结果
+          4. LLM 结合原文与上面两者仲裁出的最终结果
+          最终仲裁以原文为准，不添加原文未有的信息。审校报告作为辅助
+          信息始终保留在下方。
+    输入：results —— run_pipeline 的输出 dict。
     输出：无（直接向页面输出控件）。
     """
     # 回退提示：配置了 api 模式但没配密钥（run_pipeline 已判定回退），
@@ -251,18 +255,27 @@ def render_results(results: dict, show_corrected_only: bool = False) -> None:
     if results.get("translation_fallback"):
         st.warning("已配置 API 模式但未配置密钥，本次使用占位译文。")
     if results.get("review_fallback"):
-        st.warning("已配置 LLM 校准 API 模式但未配置密钥，本次使用占位纠正译文与占位报告。")
+        st.warning("已配置 LLM 校准 API 模式但未配置密钥，本次使用占位 LLM 结果与占位报告。")
 
-    st.subheader("翻译对照")
-    # 确定本次是否要显示原始 API 译文：只在「两者都显示」视图里出现
-    show_raw_translation = not show_corrected_only
-    # 兼容旧结果：如果 session_state 里没有 corrected_translations（旧版
-    # 结果），回退用原始译文，避免切换 radio 后 KeyError。
-    corrected_translations = results.get("corrected_translations", results["translations"])
+    st.subheader("翻译结果对比（四个结果）")
+    st.caption("最终结果以原文为最高依据进行仲裁，不添加原文未有的信息。")
 
-    # zip：把段落、原始译文、纠正译文一一配对；enumerate：从 1 开始编号段落
-    for i, (paragraph, raw_translation, corrected_translation) in enumerate(
-        zip(results["paragraphs"], results["translations"], corrected_translations), start=1
+    # 兼容旧结果：如果 session_state 里缺少某个列表（旧版结果），回退用原始译文
+    translations = results.get("translations", [])
+    direct_translations = results.get("direct_translations", translations)
+    corrected_translations = results.get("corrected_translations", translations)
+    final_translations = results.get("final_translations", corrected_translations)
+
+    # zip：把段落与四个译文一一配对；enumerate：从 1 开始编号段落
+    for i, (paragraph, raw_translation, direct_translation, corrected_translation, final_translation) in enumerate(
+        zip(
+            results["paragraphs"],
+            translations,
+            direct_translations,
+            corrected_translations,
+            final_translations,
+        ),
+        start=1,
     ):
         st.markdown(f"**第 {i} 段（阿语）**")
         # ---- 下面这行同时涉及 HTML 转义与换行处理，说明如下 ----
@@ -282,33 +295,41 @@ def render_results(results: dict, show_corrected_only: bool = False) -> None:
         # 保证用户输入里的尖括号不会破坏 div 标签本身的结构。
         st.markdown(f'<div class="ar-para">{safe_paragraph}</div>', unsafe_allow_html=True)
 
-        # 原始 API 译文（仅「两者都显示」视图展示）
-        if show_raw_translation:
-            # 译文标签随翻译模式变化：api 模式且未回退 → 真实译文；
-            # mock 或回退占位 → 带「占位」提醒。
-            if results.get("translation_mode") == settings.API_ENGINE and not results.get(
-                "translation_fallback"
-            ):
-                st.markdown(f"**第 {i} 段（原始 API 译文）**")
+        # ---- 四个结果统一渲染，减少重复代码 ----
+        def _render_one(label: str, text: str, source_is_api: bool) -> None:
+            """渲染一个译文结果块；source_is_api 决定是否带 API 占位标签。"""
+            if source_is_api:
+                # 原始 API 译文，可能因缺密钥回退占位
+                if results.get("translation_mode") == settings.API_ENGINE and not results.get(
+                    "translation_fallback"
+                ):
+                    st.markdown(f"**第 {i} 段（{label}）**")
+                else:
+                    st.markdown(f"**第 {i} 段（{label}·占位）**")
             else:
-                st.markdown(f"**第 {i} 段（原始 API 译文·占位）**")
+                # LLM 三个结果，可能因缺密钥回退占位
+                if results.get("review_mode") == settings.API_ENGINE and not results.get(
+                    "review_fallback"
+                ):
+                    st.markdown(f"**第 {i} 段（{label}）**")
+                else:
+                    st.markdown(f"**第 {i} 段（{label}·占位）**")
             st.markdown(
-                f'<div class="zh-trans">{html.escape(raw_translation)}</div>',
+                f'<div class="zh-trans">{html.escape(text)}</div>',
                 unsafe_allow_html=True,
             )
 
-        # LLM 纠正后译文：始终显示（两种视图都要）
-        if results.get("review_mode") == settings.API_ENGINE and not results.get(
-            "review_fallback"
-        ):
-            st.markdown(f"**第 {i} 段（LLM 纠正后译文）**")
-        else:
-            st.markdown(f"**第 {i} 段（LLM 纠正后译文·占位）**")
-        st.markdown(
-            f'<div class="zh-trans">{html.escape(corrected_translation)}</div>',
-            unsafe_allow_html=True,
-        )
+        _render_one("原始 API 译文", raw_translation, True)
+        _render_one("LLM 直接翻译结果", direct_translation, False)
+        _render_one("LLM 修正结果", corrected_translation, False)
+        _render_one("LLM 最终结果（以原文为准）", final_translation, False)
         st.divider()
+
+    # 翻译取舍说明：展示 LLM 在最终仲裁时对两个候选版本的取舍与原因
+    tradeoff_notes = results.get("tradeoff_notes", "")
+    if tradeoff_notes:
+        st.subheader("翻译取舍说明")
+        st.markdown(tradeoff_notes)
 
     st.subheader("术语命中")
     term_rows = _hits_to_rows(results["term_hits"], TERM_COLUMNS)
@@ -353,11 +374,11 @@ st.set_page_config(page_title="阿语审校助手 MVP", layout="wide")
 # st.title：页面大标题；st.caption：标题下的灰色说明文字
 st.title("阿拉伯语翻译审校助手（MVP）")
 st.caption(
-    "第 3.1 阶段：翻译支持双模式——默认 mock（占位译文，不联网）；"
+    "第 3.2 阶段：翻译支持双模式——默认 mock（占位译文，不联网）；"
     "配置阿里云密钥后走 api 真实翻译，缺密钥时自动回退占位译文并提示。"
-    "LLM 支持双模式——默认 mock（占位纠正译文与占位报告，不联网）；"
-    "配置 DeepSeek 密钥后走 api 真实 LLM 纠正与审校，"
-    "缺密钥时自动回退占位并提示。"
+    "LLM 支持双模式——默认 mock（占位，不联网）；"
+    "配置 DeepSeek 密钥后走 api，依次产出直接翻译、修正结果、最终仲裁与审校报告；"
+    "最终仲裁以原文为最高依据，缺密钥时自动回退占位并提示。"
 )
 
 # ---- 注入自定义样式（HTML + CSS 知识，供初学者参考）----
@@ -462,8 +483,8 @@ if st.button("开始翻译与审校", type="primary"):
             )
 
         def _on_review_start() -> None:
-            """全部段落翻译完成：提示开始 LLM 纠正与审校。"""
-            review_status.info("全部段落翻译完成，正在请求 LLM 纠正与审校…")
+            """全部段落翻译完成：提示开始 LLM 多轮处理。"""
+            review_status.info("全部段落翻译完成，正在请求 LLM 多轮处理（直接翻译/修正/最终仲裁/审校）…")
 
         def _on_review_done(_review_result: dict) -> None:
             """LLM 返回后：清空临时占位符，后续用完整结果区渲染。"""
@@ -499,29 +520,11 @@ if st.button("开始翻译与审校", type="primary"):
                 # 环境变量配置错误（如引擎取值非法、超时非正整数）
                 st.error(f"配置错误：{e}")
 
-# ---- 翻译结果展示视图（只影响展示，不影响执行）----
-# st.radio：单选按钮组控件。第一个参数是问题/标签文字，第二个参数是
-# 选项元组，horizontal=True 让选项横排显示，index=1 表示默认选中第 2 个
-# 选项（下标从 0 开始），key="review_view" 让 Streamlit 记住用户的选择
-# （页面重跑后不重置）。
-# 该控件只是「显示开关」：翻译与审校在点击按钮时已经全部执行完毕
-# （结果存在 session_state 里），切换视图不触发任何重新计算，也绝不
-# 跳过 run_pipeline——系统定位：API 机器翻译是不可省略的主步骤，LLM
-# 纠正与审校照常执行。
-view_mode = st.radio(
-    "翻译结果展示（只影响下方展示；翻译/纠正/审校照常执行）",
-    (VIEW_CORRECTED_ONLY, VIEW_RAW_AND_CORRECTED),
-    horizontal=True,
-    index=1,
-    key="review_view",
-)
-st.caption("提示：本按钮只切换展示区，run_pipeline 照常执行；审校报告始终保留在下方。")
+# ---- 结果展示说明 ----
+# 这里不再提供 radio 切换：最终对比页面固定同时展示四个翻译结果，
+# 便于人工逐段比较“原始 API 译文 / LLM 直接翻译 / LLM 修正 / 最终结果”。
+st.caption("最终结果对比：四个结果同时展示；最终结果以原文为准，不添加原文未有的信息。")
 
-# 有结果时渲染展示区（每次重跑都会重新渲染，保证结果不消失）；
-# show_corrected_only=True 时只显示 LLM 纠正后译文；False 时同时显示
-# 原始 API 译文与 LLM 纠正后译文（术语/专名命中表与审校报告仍显示）
+# 有结果时渲染展示区（每次重跑都会重新渲染，保证结果不消失）
 if "results" in st.session_state:
-    render_results(
-        st.session_state["results"],
-        show_corrected_only=(view_mode == VIEW_CORRECTED_ONLY),
-    )
+    render_results(st.session_state["results"])
