@@ -604,6 +604,55 @@ def test_api_translates_all_paragraphs_serially(monkeypatch):
         assert parsed["SourceText"] == [paragraphs[i]]
 
 
+def test_api_parallel_translates_all_paragraphs_and_calls_back(monkeypatch):
+    """验证 translate_paragraphs_parallel：并发翻译全部段落并触发回调。
+
+    作用：确认并发入口与串行入口功能等价——3 段各发 1 次请求、返回顺序
+          与段落顺序一致；每段都触发 on_translation 回调（index 为 0 基）。
+    输入：api 模式 + 假凭证；3 段文本；固定成功响应。
+    输出：返回 3 条译文；calls 长度 3；回调记录恰好覆盖 0/1/2。
+    """
+    _set_api_env(monkeypatch)
+    response = _FakeResponse(200, {"Code": "200", "Data": {"Translated": "（并发译文）"}})
+    fake_post, calls = _fixed_fake_post(response)
+    monkeypatch.setattr(translator.requests, "post", fake_post)
+
+    paragraphs = ["第1段", "第2段", "第3段"]
+    callback_log: list[tuple[int, str]] = []
+
+    def _on_translation(index: int, translation: str) -> None:
+        callback_log.append((index, translation))
+
+    translations = translator.translate_paragraphs_parallel(
+        paragraphs, None, None, on_translation=_on_translation
+    )
+    assert translations == ["（并发译文）", "（并发译文）", "（并发译文）"]
+    assert len(calls) == 3
+    # 回调按 0 基 index 覆盖全部段落；并发顺序不固定，因此用集合比较
+    assert {index for index, _ in callback_log} == {0, 1, 2}
+    assert all(translation == "（并发译文）" for _, translation in callback_log)
+
+
+def test_api_parallel_mock_mode_makes_no_network_request(monkeypatch):
+    """验证 translate_paragraphs_parallel 在 mock 模式下同样不联网。
+
+    作用：并发入口必须保持与串行入口相同的回退策略——mock 模式不发起
+          任何网络请求，直接返回占位译文。
+    输入：TRANSLATION_ENGINE=mock；假 POST 见调用即抛。
+    输出：占位译文列表；假 POST 未被调用。
+    """
+    monkeypatch.setenv(settings.ENV_ENGINE, settings.MOCK_ENGINE)
+
+    def fake_post(*args, **kwargs):
+        raise AssertionError("mock 模式不应发起任何网络请求")
+
+    monkeypatch.setattr(translator.requests, "post", fake_post)
+
+    translations = translator.translate_paragraphs_parallel(["段1", "段2"])
+    assert translations == ["（占位译文·第1段）待接入翻译 API", "（占位译文·第2段）待接入翻译 API"]
+
+
+
 def test_api_success_response_parsed(monkeypatch):
     """验证成功响应解析出译文文本。
 
