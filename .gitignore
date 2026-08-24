@@ -8,6 +8,10 @@ venv/
 
 # 测试缓存
 .pytest_cache/
+# 本地测试临时目录（沙箱/Windows 偶发无法自动清理）
+pytest_tmp*/
+pt_*/
+tmp[0-9]+/
 
 # Streamlit（为未来 secrets.toml 预留；本阶段无密钥）
 .streamlit/

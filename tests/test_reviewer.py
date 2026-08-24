@@ -817,3 +817,102 @@ def test_review_missing_content_raises_parse_error(monkeypatch, tmp_path):
         monkeypatch.setattr(reviewer.requests, "post", fake_post)
         with pytest.raises(reviewer.ReviewParseError):
             reviewer.generate_review_report(["阿语段落"], ["译文"], [], [])
+
+
+# ---------------------------------------------------------------------------
+# 阶段 3.1 新增：审校结果包（审核报告 + LLM 纠正后译文）
+# ---------------------------------------------------------------------------
+
+def test_review_bundle_mock_returns_report_and_placeholder_corrected(monkeypatch):
+    """验证 mock 模式返回的结果包同时含占位报告与占位纠正译文。
+
+    作用：确认 _generate_mock_bundle 的数据结构——report 仍是阶段 1
+          占位报告；corrected_translations 是长度与段落一致的占位纠正
+          译文列表，且不发起网络请求。
+    输入：REVIEW_ENGINE=mock；2 段输入。
+    输出：结果包含两键；报告含「占位」；纠正译文长度为 2 且含「占位纠正译文」。
+    """
+    monkeypatch.setenv(settings.ENV_REVIEW_ENGINE, settings.MOCK_ENGINE)
+
+    def fake_post(*args, **kwargs):
+        raise AssertionError("mock 模式不应发起任何网络请求")
+
+    monkeypatch.setattr(reviewer.requests, "post", fake_post)
+
+    bundle = reviewer.generate_review_bundle(["段落A", "段落B"], ["译文A", "译文B"], [], [])
+    assert "report" in bundle
+    assert "corrected_translations" in bundle
+    assert "（占位）审校报告" in bundle["report"]
+    assert len(bundle["corrected_translations"]) == 2
+    assert "占位纠正译文" in bundle["corrected_translations"][0]
+
+
+def test_review_bundle_api_parses_corrected_and_report(monkeypatch, tmp_path):
+    """验证 api 结果包能从一次 LLM 回复中拆出纠正译文与审校报告。
+
+    作用：模拟新版 LLM 返回「## 纠正后译文 + ## 审校报告」的完整结构，
+          确认 generate_review_bundle 把两段分别解析到正确键里，且仍只发起
+          1 次请求（不额外增加一次纠正调用）。
+    输入：api 模式 + 假密钥 + 测试模板；假响应 content 含两个二级标题。
+    输出：corrected_translations 为按段号提取的 2 条译文；report 为审校报告段。
+    """
+    _set_api_review_env(monkeypatch)
+    _write_template(monkeypatch, tmp_path)
+    content = (
+        "## 纠正后译文\n\n"
+        "第1段：纠正后的译文一\n"
+        "第2段：纠正后的译文二\n\n"
+        "## 审校报告\n\n"
+        "### 1. 文本概况\n这是测试报告。"
+    )
+    ok_response = _FakeResponse(200, {"choices": [{"message": {"content": content}}]})
+    fake_post, calls = _fixed_fake_post(ok_response)
+    monkeypatch.setattr(reviewer.requests, "post", fake_post)
+
+    bundle = reviewer.generate_review_bundle(["段落A", "段落B"], ["译文A", "译文B"], [], [])
+    assert len(calls) == 1
+    assert bundle["corrected_translations"] == ["纠正后的译文一", "纠正后的译文二"]
+    assert "### 1. 文本概况" in bundle["report"]
+    assert "这是测试报告" in bundle["report"]
+
+
+def test_review_bundle_api_falls_back_when_no_sections(monkeypatch, tmp_path):
+    """验证模型未按新版结构输出时，结果包安全回退。
+
+    作用：兼容旧版/降级响应——返回内容只有审校报告，没有纠正译文标题时，
+          corrected_translations 回退为原始译文列表，report 保留完整返回文本。
+          页面不会因此崩溃。
+    输入：api 模式；假响应 content 仅含普通报告文本。
+    输出：报告等于该文本；纠正译文等于原始译文列表。
+    """
+    _set_api_review_env(monkeypatch)
+    _write_template(monkeypatch, tmp_path)
+    ok_response = _FakeResponse(
+        200, {"choices": [{"message": {"content": "（旧版审校报告）"}}]}
+    )
+    fake_post, _ = _fixed_fake_post(ok_response)
+    monkeypatch.setattr(reviewer.requests, "post", fake_post)
+
+    bundle = reviewer.generate_review_bundle(["段落A"], ["原始译文"], [], [])
+    assert bundle["report"] == "（旧版审校报告）"
+    assert bundle["corrected_translations"] == ["原始译文"]
+
+
+def test_parse_review_bundle_falls_back_on_wrong_count(monkeypatch):
+    """验证纠正译文段数与原段落数不一致时回退原始译文。
+
+    作用：LLM 偶尔漏段/多段时，若强行按提取结果展示会导致段落错位；
+          这里锁定「数量不符即回退」的降级策略。
+    输入：content 含「## 纠正后译文」但只写了 1 段，而原文有 2 段。
+    输出：corrected_translations 返回原始 2 条译文，不抛异常。
+    """
+    content = (
+        "## 纠正后译文\n\n"
+        "第1段：只有一个纠正\n\n"
+        "## 审校报告\n\n"
+        "报告正文"
+    )
+    bundle = reviewer._parse_review_bundle(content, ["段落A", "段落B"], ["译文A", "译文B"])
+    assert bundle["corrected_translations"] == ["译文A", "译文B"]
+    assert "报告正文" in bundle["report"]
+

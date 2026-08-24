@@ -34,6 +34,7 @@ app.py 顶部，命令行直接调用 run_pipeline 时需要自行 load_dotenv�
 - 密钥只允许存在于环境变量（.env）中，.env 已被 .gitignore 忽略。
 """
 
+import re  # 标准库：解析 LLM 输出中「纠正后译文」的段号行
 from pathlib import Path  # 标准库：跨平台路径处理（定位提示词模板）
 
 import requests  # 第三方库：HTTP 客户端，用于调用 LLM 审校接口
@@ -63,6 +64,12 @@ _PLACEHOLDERS = ("source_paragraphs", "translations", "term_hits", "name_hits")
 # 校验要求两个标记都存在、且系统标记在用户标记之前。
 _USER_SECTION_MARKER = "## 用户消息"
 _SYSTEM_SECTION_MARKER = "## 系统消息"
+
+# LLM 返回内容的结构标记：程序从一次回复中同时提取「纠正后译文」与
+# 「审校报告」两段。若模型没有按这两个标题输出，程序会安全回退——
+# 纠正译文退回原始 API 译文，报告保留整段返回内容（兼容旧版/降级）。
+_CORRECTED_SECTION_MARKER = "## 纠正后译文"
+_REPORT_SECTION_MARKER = "## 审校报告"
 
 # LLM 采样温度：固定 0.3（偏低温，审校任务希望输出稳定、少发散；
 # 阶段 3 决策：不配环境变量）
@@ -130,41 +137,141 @@ def generate_review_report(
     term_hits: list[dict],
     name_hits: list[dict],
 ) -> str:
-    """生成审校报告文本（markdown 格式，双模式入口）。
+    """生成审校报告文本（markdown 格式，兼容入口）。
 
-    作用：审校流水线的出口。按配置决定走 mock（占位报告）还是 api
-          （真实 LLM 审校报告）：
-          - 空输入（paragraphs 为空）→ 直接返回占位报告，api 模式
-            同样不发任何请求（与翻译契约对称）；
+    作用：只返回审校报告字符串。实现上委托给 generate_review_bundle，
+          从同一份结果里取 "report" 键——这样旧调用方（含旧测试）无需
+          改动，同时新页面可以直接使用 generate_review_bundle 拿纠正译文。
+    输入/输出/异常：与 generate_review_bundle 相同，仅输出为 str 报告。
+    """
+    return generate_review_bundle(paragraphs, translations, term_hits, name_hits)["report"]
+
+
+def generate_review_bundle(
+    paragraphs: list[str],
+    translations: list[str],
+    term_hits: list[dict],
+    name_hits: list[dict],
+) -> dict:
+    """生成「审校报告 + LLM 纠正后译文」结果包（双模式入口）。
+
+    作用：一次调用的结果同时包含两个展示所需的数据：
+          - "report"：8 项结构的 markdown 审校报告（延续阶段 3）；
+          - "corrected_translations"：与段落一一对应的 LLM 纠正后译文列表。
+          按配置决定走 mock（占位）还是 api（真实 LLM）：
+          - 空输入（paragraphs 为空）→ 直接返回占位报告与空/原译文列表，
+            api 模式同样不发任何请求（与翻译契约对称）；
           - engine == "mock"，或 engine == "api" 但缺凭证
-            （has_credentials 为 False）→ 走 _generate_mock_report，
+            （has_credentials 为 False）→ 走 _generate_mock_bundle，
             占位文案与阶段 1 逐字节一致；
-          - engine == "api" 且有凭证 → 读取提示词模板、填入数据、
-            调用 LLM，返回 8 项结构的 markdown 审校报告。
+          - engine == "api" 且有凭证 → 读取提示词模板、填入数据、调用 LLM，
+            返回同时含纠正译文与审校报告的结果包。
     输入：paragraphs —— list[str]，阿语段落列表；
-          translations —— list[str]，与段落一一对应的译文列表；
-          term_hits —— list[dict]，术语命中列表（scan_glossary 的输出，
-          含「阿语原文」「处理方式」等键与 "paragraphs"/"count"）；
-          name_hits —— list[dict]，专名命中列表，结构同 term_hits
-          （无「领域」「处理方式」两列）。
-    输出：str —— 审校报告文本（markdown 格式，可在 Streamlit 中渲染）；
+          translations —— list[str]，与段落一一对应的原始 API 译文列表；
+          term_hits —— list[dict]，术语命中列表；
+          name_hits —— list[dict]，专名命中列表。
+    输出：dict —— 键 "report"（str）与 "corrected_translations"（list[str]）。
           各列表为空时返回仅含统计数字（0 段、0 条）的占位报告，不报错。
     异常：api 模式任一阶段失败（网络/业务/解析）抛对应 ReviewError
           子类；模板缺失抛 FileNotFoundError；环境变量非法抛 ValueError。
     """
     # 空输入短路：不加载配置、不发请求（契约：api 模式也如此）
     if not paragraphs:
-        return _generate_mock_report(paragraphs, term_hits, name_hits)
+        return _generate_mock_bundle(paragraphs, translations, term_hits, name_hits)
 
     # 加载审校配置（读取环境变量；非法值在此抛 ValueError，由 UI 层提示）
     config = load_review_config()
 
-    # 回退条件：mock 模式本来就不联网；api 模式缺密钥也回退占位报告
+    # 回退条件：mock 模式本来就不联网；api 模式缺密钥也回退占位数据
     if config.engine == MOCK_ENGINE or not config.has_credentials:
-        return _generate_mock_report(paragraphs, term_hits, name_hits)
+        return _generate_mock_bundle(paragraphs, translations, term_hits, name_hits)
 
-    # api 模式：编排「模板 → 数据填充 → 请求 → 解析」全流程
-    return _review_with_api(paragraphs, translations, term_hits, name_hits, config)
+    # api 模式：编排「模板 → 数据填充 → 请求 → 解析」全流程；
+    # _review_with_api 返回原始 content，再由 _parse_review_bundle 拆出
+    # 纠正译文与审校报告两段。
+    content = _review_with_api(paragraphs, translations, term_hits, name_hits, config)
+    return _parse_review_bundle(content, paragraphs, translations)
+
+
+def _generate_mock_bundle(
+    paragraphs: list[str],
+    translations: list[str],
+    term_hits: list[dict],
+    name_hits: list[dict],
+) -> dict:
+    """生成占位版「审校报告 + 纠正译文」（mock / 缺密钥回退；不联网）。
+
+    作用：报告文案与阶段 1 逐字节一致；纠正译文用独立的占位文案，
+          让页面清楚看到“当前不是真实 LLM 纠正”——避免把原始 API
+          译文伪装成 LLM 纠正结果。
+    输入：paragraphs / translations / term_hits / name_hits —— 同公开入口。
+    输出：dict —— {"report": str, "corrected_translations": list[str]}。
+    """
+    return {
+        "report": _generate_mock_report(paragraphs, term_hits, name_hits),
+        "corrected_translations": [
+            f"（占位纠正译文·第{i + 1}段）待接入 LLM 纠正" for i in range(len(paragraphs))
+        ],
+    }
+
+
+def _parse_review_bundle(
+    content: str, paragraphs: list[str], translations: list[str]
+) -> dict:
+    """把 LLM 返回内容拆成「纠正后译文 + 审校报告」。
+
+    作用：新版提示词要求 LLM 先输出「## 纠正后译文」再输出
+          「## 审校报告」。本函数优先按这两个二级标题切分；若模型没有
+          按该结构输出（例如旧版模型、只返回报告），则安全回退——
+          纠正译文退回原始 API 译文列表，报告保留整段返回文本。
+          这样页面永远有可展示的数据，不会因格式偏差崩溃。
+    输入：content —— LLM 返回的完整 markdown 文本；
+          paragraphs —— 阿语段落列表（用于校验段数）；
+          translations —— 原始 API 译文列表（解析失败时作为纠正译文兜底）。
+    输出：dict —— {"report": str, "corrected_translations": list[str]}。
+    """
+    # 两个结构标记必须都存在，否则说明模型没按新版结构输出 → 回退
+    if _CORRECTED_SECTION_MARKER not in content or _REPORT_SECTION_MARKER not in content:
+        return {"report": content.strip(), "corrected_translations": list(translations)}
+
+    # 在「纠正后译文」段与「审校报告」段之间截出纠正译文原始块
+    corrected_part = content.split(_CORRECTED_SECTION_MARKER, 1)[1]
+    corrected_part = corrected_part.split(_REPORT_SECTION_MARKER, 1)[0]
+    corrected_translations = _parse_numbered_translations(corrected_part, paragraphs, translations)
+
+    # 审校报告取「## 审校报告」之后的全部内容并去掉首尾空白
+    report = content.split(_REPORT_SECTION_MARKER, 1)[1].strip()
+    return {"report": report, "corrected_translations": corrected_translations}
+
+
+def _parse_numbered_translations(
+    text: str, paragraphs: list[str], translations: list[str]
+) -> list[str]:
+    """从「第N段：…」文本中解析出纠正后译文列表。
+
+    作用：LLM 输出的纠正译文通常按「第1段：...」逐行列出。这里用正则
+          提取每个「第N段：」到下一个段号/标题之间的内容；若提取到的
+          条数与段落数不一致，则说明模型格式不规范，回退使用原始译文。
+    输入：text —— 「纠正后译文」段内的 markdown 文本；
+          paragraphs —— 阿语段落列表（用于校验数量）；
+          translations —— 原始 API 译文列表（数量不符时兜底）。
+    输出：list[str] —— 与 paragraphs 等长的纠正译文列表。
+    """
+    # (?s) 让 . 匹配换行；(.*?) 非贪婪；(?=...) 下一条段号或二级标题处截断
+    pattern = re.compile(
+        r"第(\d+)段[:：](.*?)(?=\n\s*第\d+段[:：]|\n\s*## |\Z)", re.S
+    )
+    matches = pattern.findall(text)
+    # 解析出的条数必须与原段落数一致才算可信；否则旧数据兜底
+    if len(matches) != len(paragraphs):
+        return list(translations)
+
+    corrected = []
+    for number_str, segment in matches:
+        # 去掉行内常见的 markdown 加粗/斜体标记，保留正文
+        clean = re.sub(r"[*_#>`]", "", segment).strip()
+        corrected.append(clean)
+    return corrected
 
 
 def _generate_mock_report(

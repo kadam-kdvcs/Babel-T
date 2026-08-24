@@ -37,6 +37,8 @@ import hashlib  # 标准库：摘要算法（sha1，供 hmac 使用）
 import hmac  # 标准库：HMAC 消息认证（阿里云签名算法核心）
 import uuid  # 标准库：生成请求唯一编号 SignatureNonce（防重放攻击）
 import urllib.parse  # 标准库：URL 百分号编码（quote）
+from collections.abc import Callable  # 标准库：类型标注用（回调函数）
+from concurrent.futures import ThreadPoolExecutor, as_completed  # 标准库：并发翻译 + 动态回调
 from datetime import datetime, timezone  # 标准库：UTC 时间戳（ISO8601）
 
 import requests  # 第三方库：HTTP 客户端，用于调用阿里云翻译接口
@@ -48,6 +50,11 @@ from modules.settings import (
     TranslationConfig,       # 配置对象（参数类型标注用）
     load_translation_config, # 加载配置（翻译入口处调用）
 )
+
+
+# 并发翻译默认线程数：阿里云翻译一次只处理一段，多段同时请求可显著减少
+# 总等待时间；默认 4 足够当前 5 段样例，过高可能触发接口限流。
+_DEFAULT_MAX_WORKERS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +218,80 @@ def translate_paragraphs(
             _translate_with_api(paragraph, constraints, config, i + 1)
         )
     return translations
+
+
+def translate_paragraphs_parallel(
+    paragraphs: list[str],
+    term_hits: list[dict] | None = None,
+    name_hits: list[dict] | None = None,
+    *,
+    on_translation: Callable[[int, str], None] | None = None,
+    max_workers: int = _DEFAULT_MAX_WORKERS,
+) -> list[str]:
+    """并行翻译段落，供 Streamlit 页面动态展示“翻译中/已翻译”。
+
+    作用：与 translate_paragraphs 功能一致（mock 回退、api 真实翻译），
+          但 api 模式下用线程池同时发起多个段落翻译请求，从而显著缩短
+          多段文本的总等待时间。每完成一段就调用 on_translation(index,
+          translation)（index 为 0 基；主线程调用，可安全更新 Streamlit
+          empty 占位符）。
+          LLM 纠正是整篇文章级别的任务，仍需等全部段落翻译完后再进行；
+          因此本函数不处理 LLM 步骤。
+    输入：paragraphs —— 阿语段落列表；term_hits / name_hits —— 命中列表；
+          on_translation —— 可选回调（index, translation）；
+          max_workers —— 并发线程数，默认 4。
+    输出：list[str] —— 与输入同长度、同顺序的译文列表。
+    异常：与 translate_paragraphs 一致：api 模式任一失败抛对应
+          TranslationError 子类（携带段落号）；环境变量非法抛 ValueError。
+    """
+    # 空输入直接返回空列表：不加载配置、不发请求（契约同串行版）
+    if not paragraphs:
+        return []
+
+    # 加载配置（读取环境变量；非法值在此抛 ValueError，由 UI 层提示）
+    config = load_translation_config()
+
+    # 回退条件：mock 模式或 api 缺凭证 → 占位，不联网；这时无需并发
+    if config.engine == MOCK_ENGINE or not config.has_credentials:
+        return _translate_with_mock(paragraphs)
+
+    # api 模式：把所有段落提交给线程池，主线程按“先完成先回调”逐个展示。
+    # 结果存进预分配列表，最终按原段落顺序返回。
+    translations: list[str | None] = [None] * len(paragraphs)
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    future_to_index = {}
+    for i, paragraph in enumerate(paragraphs):
+        # 段落号 1 基；每段构建只含本段命中的约束文本
+        constraints = build_translation_constraints(
+            term_hits, name_hits, paragraph_no=i + 1
+        )
+        future_to_index[
+            executor.submit(
+                _translate_with_api, paragraph, constraints, config, i + 1
+            )
+        ] = i
+
+    try:
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            # future.result() 会把子线程里的异常原样抛出（含段落号）
+            translated = future.result()
+            translations[index] = translated
+            # 主线程回调：Streamlit 的 st.empty 只能在主脚本线程安全更新
+            if on_translation is not None:
+                on_translation(index, translated)
+    except Exception:
+        # 任一段失败：取消尚未开始的请求，尽量体现“一段失败中断整批”；
+        # 已在其他线程进行中的请求无法强行中止，但不会新增后续请求。
+        for future in future_to_index:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+
+    # ThreadPoolExecutor 返回顺序不影响这里：translations 已按原索引填好
+    return [item for item in translations if item is not None]
 
 
 def _translate_with_mock(paragraphs: list[str]) -> list[str]:

@@ -144,3 +144,31 @@
 - 冒烟：mock 占位（review_mode=mock）/ api 缺 key 回退（review_fallback=True）/ api 真 key 8 项报告 / api 假 key st.error「审校失败」旧结果保留；radio 两种视图切换正常
 - 安全核查：代码/测试/文档无任何真实密钥；异常消息不含密钥；业务错误片段截断 200 字符；st.markdown 渲染 LLM 输出不传 unsafe_allow_html（防注入）
 - 用户密钥曾在聊天中暴露，联调通过后建议在阿里云/DeepSeek 控制台**轮换重置**
+
+## 2026-08-24 · 第 3.1 阶段确认：翻译结果两种展示选项
+
+### 一、需求确认
+
+用户提出当前「仅 LLM 校准（审校报告）/ LLM 校准 + API 翻译结果」两个选项不符合预期，应为：
+
+1. **显示 LLM 纠正过后的翻译**
+2. **显示原始 API 翻译 + LLM 纠正过后的翻译结果（两者都显示）**
+
+关键澄清：原代码里 LLM 只生成 8 项审校报告（模板明确“不重翻全文”），并不存在“LLM 纠正后译文”。用户确认采用推荐方案：**增加 LLM 纠正译文生成 + 页面两个展示模式，保留审校报告作为辅助展示**。
+
+### 二、设计决策
+
+| 决策点 | 结论 |
+|---|---|
+| 生成方式 | `generate_review_bundle` 一次 LLM 调用同时返回 `report` 与 `corrected_translations`；`generate_review_report` 保留为只取 `report` 的兼容包装 |
+| 提示词 | `prompts/review_report_prompt.md` 改为「先输出 `## 纠正后译文`，再输出 `## 审校报告`」；约束由“绝不重翻全文”改为“在给定译文基础上修正，不脱离原文另译” |
+| 解析回退 | LLM 未按新版结构输出时：report 保留整段返回文本，corrected_translations 回退为原始 API 译文，避免页面崩溃 |
+| mock/缺 key | 纠正译文使用「（占位纠正译文·第N段）待接入 LLM 纠正」，不把原始译文伪装成 LLM 纠正结果 |
+| 页面视图 | radio 改为「显示 LLM 纠正过后的翻译 / 显示原始 API 翻译 + LLM 纠正过后的翻译结果（两者都显示）」，默认显示两者；审校报告始终保留在下方 |
+| 并发与动态展示 | API 翻译多段采用 `ThreadPoolExecutor(4)` 并发请求；页面通过 `run_pipeline_progressive` + `st.empty` 动态显示「等待翻译 → 翻译完成 → LLM 审校中」；LLM 必须以整篇文章为输入，所以仍在全部段落翻译完成后才启动 |
+| 测试 | 新增 4 条结果包相关单测 + 2 条并发翻译单测；原有 reviewer 测试兼容（旧函数仍走 bundle 但返回 report） |
+
+### 三、验证情况
+
+- `python -m py_compile` 通过；`run_pipeline` mock 冒烟返回 `corrected_translations` 且长度与段落一致
+- 全量 `python -m pytest -q` 通过：**103 passed**（99 条原有 + 4 条新增）

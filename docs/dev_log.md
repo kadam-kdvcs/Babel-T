@@ -171,6 +171,76 @@
 
 ---
 
+## 阶段 3.1（2026-08-24）：LLM 纠正后译文 + 两种翻译结果展示
+
+**目标**：用户反馈当前「仅 LLM 校准（审校报告）/ LLM 校准 + API 翻译结果」两个选项不符合预期，应为「显示 LLM 纠正过后的翻译 / 显示原始 API 翻译 + LLM 纠正过后的翻译结果（两者都显示）」。
+原代码只生成 8 项审校报告，并未生成真正可展示的“LLM 纠正后译文”。
+本次改动让 LLM 一次调用同时输出「逐段纠正后译文 + 审校报告」，并保留审校报告作为辅助展示。
+
+### 新增/主要改动文件
+
+| 文件 | 行号（当前） | 改动内容与作用 |
+|---|---|---|
+| modules/reviewer.py | :37、:71-73 | 新增 `import re`；新增 `_CORRECTED_SECTION_MARKER = "## 纠正后译文"` 与 `_REPORT_SECTION_MARKER = "## 审校报告"` 两个输出结构标记 |
+| modules/reviewer.py | :134-264 | `generate_review_report` 改为兼容薄包装（调用 bundle 后只取 `report`）；新增 `generate_review_bundle`（一次调用返回 `{"report", "corrected_translations"}`）、`_generate_mock_bundle`（占位报告 + 占位纠正译文）、`_parse_review_bundle`（按两个二级标题拆 LLM 回复，未按结构输出时回退 `corrected_translations=原译文`、`report=整段文本`）、`_parse_numbered_translations`（从「第N段：…」解析纠正译文；条数不符时回退原译文） |
+| prompts/review_report_prompt.md | 全文 | 提示词改为先输出 `## 纠正后译文`（逐段「第N段：纠正后译文」），再输出 `## 审校报告`（8 项）；约束由“绝不重翻全文”改为“在给定译文基础上修正，不脱离原文另译” |
+| app.py | :7、:19、:72-73 | 模块 docstring 更新为阶段 3.1；radio 常量改为 `VIEW_CORRECTED_ONLY` / `VIEW_RAW_AND_CORRECTED` |
+| app.py | :101、:143、:157 | `run_pipeline` 返回 dict 新增 `corrected_translations`，调用 `generate_review_bundle` 同时取 `report` 与 `corrected_translations` |
+| app.py | :197-268 | `render_results(results, show_corrected_only=False)`：翻译对照区改为展示“原始 API 译文（可选）+ LLM 纠正后译文”；`show_corrected_only=True` 时只显示纠正译文，`False` 时两者都显示；兼容旧 session_state 缺 `corrected_translations` 时回退原始译文；审校报告仍保留 |
+| app.py | :289、:397-421 | 去掉审校报告区的重复 fallback warning；radio 文案/说明改为“翻译结果展示”；渲染调用改为 `show_corrected_only=(view_mode == VIEW_CORRECTED_ONLY)` |
+| tests/test_reviewer.py | :823-925 | 新增 4 条：结果包 mock 占位、api 解析纠正译文与报告、无结构标记安全回退、纠正段数不符回退 |
+| README.md | 当前阶段/审校双模式/展示说明 | 阶段改为 3.1；说明 LLM 同时输出纠正译文 + 审校报告；radio 文案同步 |
+| CLAUDE.md | 关键设计约定/当前阶段 | 补充 `generate_review_bundle` / `corrected_translations` / 两种展示视图 / 并发翻译；测试数更新为 105 |
+| docs/modules.md | reviewer 节、app 节、tests 表 | reviewer 增加 bundle 函数与解析回退说明；app 增加 `show_corrected_only`、10 键返回结构、两种展示视图；测试表增加 4 条 |
+| docs/meeting_notes.md | 末尾 | 追加「2026-08-24 · 第 3.1 阶段确认：翻译结果两种展示选项」决策记录 |
+| .gitignore | :10-13 | 追加本地 pytest 临时目录忽略规则（`pytest_tmp*/`、`pt_*/`、`tmp[0-9]+/`），避免测试残留目录入库 |
+| app.py | :319-323 | 页面顶部 caption 由「第 3 阶段」更新为「第 3.1 阶段」，补充 LLM 纠正译文与审校说明（Playwright 测试发现文案不一致后修复） |
+| docs/test_report_2026-08-24.md | 全文新增 | Playwright UI 测试报告：真实 API/LLM 模式、Mock 模式、两种展示视图、空输入校验；测试结果通过 |
+| modules/translator.py | :40-42、:54-57、:222-286 | 新增 `ThreadPoolExecutor` / `as_completed` / `Callable` 导入；新增 `_DEFAULT_MAX_WORKERS = 4`；新增 `translate_paragraphs_parallel(...)` 并发翻译入口（api 模式多段同时请求、主线程回调 on_translation、失败取消未开始请求） |
+| app.py | :90-180、:409-470 | `run_pipeline` 改为委托 `run_pipeline_progressive`；新增渐进式流水线（on_paragraphs / on_translation / on_review_start / on_review_done）；按钮点击使用 st.empty 占位符动态显示“原文立即显示→译文逐个补充→LLM 审校中”，LLM 返回后渲染完整结果 |
+| tests/test_translator.py | 新增 2 条 | `test_api_parallel_translates_all_paragraphs_and_calls_back`、`test_api_parallel_mock_mode_makes_no_network_request` |
+
+### 阶段 3.1 开发/验证结果
+
+- `python -m py_compile app.py modules/reviewer.py tests/test_reviewer.py` 通过
+- 全量 `python -m pytest -q`：**105 passed**（103 条原有 + 2 条并发翻译新增）
+- `run_pipeline` mock 冒烟返回 `corrected_translations`，且长度与段落数一致
+- 页面两种视图：
+  - 仅 LLM 纠正后译文
+  - 原始 API 译文 + LLM 纠正后译文（默认）
+  - 审校报告始终保留在下方
+- Playwright 动态渲染验证通过：原文立即显示 → 译文逐个补充 → LLM 审校中 → 完整结果
+
+---
+
+## 远期备选（当前暂缓）：Web 前后端分离重构
+
+> 用户明确指示：**当前先不推进前端重构计划**。此节仅作为远期技术备选记录，不作为下一步执行计划。
+> 当前阶段仍以 Streamlit 版本为主。
+
+**目标（若未来启动）**：保留当前 Streamlit 版本作保底，同时按「Django + DRF 后端 API + TypeScript 前端」路线搭建新的可拓展主界面。
+前端框架暂不锁定（Vue 3 / React 后续对比后再定），因此第一阶段先做与框架无关的后端 API 和前端骨架。
+
+### 若启动时的待办清单（按依赖顺序）
+
+| 阶段 | 任务 | 说明 |
+|---|---|---|
+| 0 | 业务层整理 | 给 `modules/` 加 `__init__.py`；把 `run_pipeline_progressive` 的核心逻辑抽到独立 service（如 `services/pipeline_service.py`），让 Streamlit 和 Django 共用 |
+| 1 | Django + DRF API | 新建 Django 项目与 `POST /api/v1/translate/`，复用 `modules/`；翻译异常映射为统一 JSON 错误；保留现有 pytest |
+| 2 | Vite + TS 骨架 | 新建前端目录；先做框架无关页面（原文输入、按钮、结果展示、两种翻译视图）；Vite dev proxy 转发 `/api` 到 Django |
+| 3 | 前端框架落地 | 对比 Vue 3 / React 后二选一；把骨架组件化 |
+| 4 | 功能对齐 | 与 Streamlit 逐项对比：mock、api 缺 key、api 真 key、两种视图、动态展示、异常提示 |
+| 5 | 后续拓展 | 数据库保存审校记录、登录权限、术语库管理、导出 PDF/Word |
+
+### 关键约束
+
+- Streamlit `app.py` 保持不动或仅做小幅兼容，始终可作为保底版本。
+- `.env` 密钥只允许后端读取，前端绝不接触密钥。
+- 前端框架没定之前，不写 Vue/React 专有组件，只写 API 类型和调用层。
+- 当前 105 条 pytest 必须继续全绿；新增 Django/API 测试后总数继续增长。
+
+---
+
 ## 附：环境变量一览（模块 modules/settings.py）
 
 | 变量 | 默认值 | 用途 |
