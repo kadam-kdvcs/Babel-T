@@ -587,7 +587,7 @@ def save_l1_review(
     record_id: int,
     *,
     teacher_decision: str,
-    teacher_error_types: list[str],
+    teacher_error_types: list[str] | None = None,
     teacher_custom_error_types: str = "",
     teacher_severity: str = "null",
     teacher_revision: str = "",
@@ -595,13 +595,35 @@ def save_l1_review(
 ) -> None:
     """保存教师原始审校 L1。
 
+    输入：
+      - teacher_decision：pass / revise / retranslate（教师结论，必填）
+      - teacher_error_types：可选问题类型列表；不传时保存空列表，
+        问题类型由 L2 AI 标准化时推断，不要求教师手工填写。
+      - teacher_custom_error_types：其他问题类型的文字归类（兼容旧数据）
+      - teacher_severity：可选严重程度；不传时保存 "null"
+      - teacher_revision：教师最终译文
+      - teacher_raw_comment：教师原始说明（绝对原样保存）
+
     规则：
     - draft_translation 在创建记录时已固定，本函数绝不更新它；
     - teacher_raw_comment 只在这里写入，后续 L2/L3 不覆盖；
-    - teacher_custom_error_types 保存“其他”问题类型时教师自定义分类。
+    - 自动根据 AI 原始译文与教师最终译文生成 translation_diff；
+    - teacher_error_types / teacher_severity 只作为旧字段兼容保留，
+      新界面不再要求教师填写，AI 推断结果写入 normalized_review。
     """
     ts = now_iso()
+    error_types = list(teacher_error_types or [])
     with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT draft_translation FROM review_records WHERE id = ?",
+            (record_id,),
+        ).fetchone()
+        draft = (row["draft_translation"] or "") if row else ""
+        revision = teacher_revision or ""
+        if draft.strip() and revision.strip() and revision != draft:
+            translation_diff = f"AI 原始译文：{draft}\n教师最终译文：{revision}"
+        else:
+            translation_diff = ""
         conn.execute(
             """
             UPDATE review_records SET
@@ -611,16 +633,18 @@ def save_l1_review(
               teacher_severity = ?,
               teacher_revision = ?,
               teacher_raw_comment = ?,
+              translation_diff = ?,
               updated_at = ?
             WHERE id = ?
             """,
             (
                 teacher_decision,
-                _json_dumps(teacher_error_types),
+                _json_dumps(error_types),
                 teacher_custom_error_types,
                 teacher_severity,
-                teacher_revision,
+                revision,
                 teacher_raw_comment,
+                translation_diff,
                 ts,
                 record_id,
             ),

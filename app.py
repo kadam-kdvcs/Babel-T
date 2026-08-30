@@ -25,7 +25,6 @@ LLM 直接翻译结果、LLM 修正结果、LLM 最终结果（以原文为准�
 """
 
 import html  # 标准库：转义用户文本，防止 HTML 注入
-import json  # 标准库：读取/确认 L2/L3 JSON 内容
 from collections.abc import Callable  # 标准库：类型标注用（流水线回调）
 from pathlib import Path  # 标准库：跨平台路径处理
 
@@ -451,8 +450,158 @@ def render_results(results: dict) -> None:
 
 
 
+def _decision_label(value: str | None) -> str:
+    """把审校结论英文值转为中文标签。"""
+    return {"pass": "通过", "revise": "修改", "retranslate": "重译"}.get(value or "", value or "未提交")
+
+
+def _render_natural_review(review: dict) -> None:
+    """用自然语言展示 L2/L3 审校结果，不显示 JSON。"""
+    st.markdown("**审校意见：**")
+    error_types = review.get("error_types") or []
+    if isinstance(error_types, str):
+        error_types = [error_types] if error_types else []
+    if error_types:
+        type_labels = {
+            "semantic_mistranslation": "语义误译", "omission": "漏译",
+            "addition": "增译", "grammar": "语法理解", "reference": "指代关系",
+            "proper_name_or_term": "专名/术语", "style": "语体风格",
+            "chinese_expression": "中文表达", "cultural_context": "文化背景",
+            "footnote_or_note": "脚注/译者注", "punctuation_or_format": "标点/格式",
+            "other": "其他",
+        }
+        st.write("问题类型：" + "、".join(type_labels.get(t, t) for t in error_types))
+    severity = review.get("severity")
+    if severity and severity != "null":
+        st.write("严重程度：" + {"minor": "轻微", "moderate": "一般", "major": "严重"}.get(severity, severity))
+    if review.get("problem_summary"):
+        st.write(review["problem_summary"])
+    if review.get("revision_instruction"):
+        st.write(review["revision_instruction"])
+    if review.get("normalized_comment"):
+        st.write(review["normalized_comment"])
+    standards = review.get("translation_standards") or []
+    if isinstance(standards, str):
+        standards = [standards] if standards else []
+    if standards:
+        st.write("翻译规范候选：" + "、".join(standards))
+    changes = review.get("term_changes") or []
+    if isinstance(changes, str):
+        changes = [changes] if changes else []
+    if changes:
+        st.write("术语变化：" + "、".join(changes))
+
+
+def _render_teacher_review(record: dict, selected_id: int, para_id: int, para: dict) -> None:
+    """渲染已提交的教师审校：展示 L1 摘要、L2 自然语言意见、确认/修改流程。"""
+    st.markdown(f"#### 教师审校：第 {para['paragraph_index'] + 1} 段")
+    decision_text = _decision_label(record.get("teacher_decision"))
+    l2_status = record.get("normalized_status") or "未生成"
+    st.caption(
+        f"审校结论：{decision_text} ｜ "
+        f"L2：{l2_status} ｜ "
+        f"verified：{'是' if record.get('verified') else '否'}"
+    )
+
+    if record.get("teacher_revision"):
+        safe_revision = html.escape(record["teacher_revision"])
+        st.markdown("**教师最终译文：**")
+        st.markdown(f'<div class="zh-trans">{safe_revision}</div>', unsafe_allow_html=True)
+    if record.get("translation_diff"):
+        st.text("修改前后差异：")
+        st.text(record["translation_diff"])
+    if record.get("teacher_raw_comment"):
+        st.markdown(f"**教师原始说明：** {record['teacher_raw_comment']}")
+    if record.get("teacher_custom_error_types"):
+        st.markdown(f"**其他问题归类：** {record['teacher_custom_error_types']}")
+
+    normalized = record.get("normalized_review") or {}
+    if record.get("verified"):
+        _render_natural_review(record.get("verified_review") or normalized)
+        st.success("已确认，进入高质量审校库。")
+        return
+
+    if normalized:
+        _render_natural_review(normalized)
+        if normalized.get("has_conflict"):
+            st.warning(
+                "检测到教师结论与说明可能存在冲突，请人工判断后再确认。"
+                f"冲突字段：{normalized.get('conflict_fields')}"
+            )
+
+        confirm_key = f"confirm_l3_v2_{selected_id}_{para_id}"
+        edit_toggle_key = f"edit_l3_v2_{selected_id}_{para_id}"
+        editing_key = f"editing_l3_v2_{selected_id}_{para_id}"
+
+        # 「确认」：直接以当前 L2 进入 verified
+        if st.button("确认", key=confirm_key):
+            storage.save_l3_verified(
+                None, record["id"], verified_review=normalized, reviewer_id="teacher"
+            )
+            st.success("已确认，进入高质量审校库。")
+            st.rerun()
+
+        # 「修改」：打开普通文本编辑框，确认后写入 verified_review
+        if st.button("修改", key=edit_toggle_key):
+            st.session_state[editing_key] = True
+        if st.session_state.get(editing_key):
+            default_text = normalized.get("normalized_comment") or ""
+            if not default_text and normalized.get("problem_summary"):
+                default_text = normalized["problem_summary"]
+            edited_text = st.text_area(
+                "普通文本审校意见（可修改）",
+                value=default_text,
+                key=f"confirm_text_v2_{selected_id}_{para_id}",
+                height=150,
+            )
+            if st.button(
+                "确认修改",
+                key=f"confirm_edit_v2_{selected_id}_{para_id}",
+            ):
+                confirmed = dict(normalized)
+                confirmed["normalized_comment"] = edited_text.strip()
+                # 人工修改后的意见视为教师已解决冲突，不再阻断确认
+                confirmed["has_conflict"] = False
+                confirmed["conflict_fields"] = []
+                confirmed["conflict_explanation"] = ""
+                storage.save_l3_verified(
+                    None, record["id"], verified_review=confirmed, reviewer_id="teacher"
+                )
+                st.success("已确认修改，进入高质量审校库。")
+                st.rerun()
+    else:
+        # L2 生成失败：L1 已保留，可手动确认 L1 为标准 L2
+        st.info("AI 标准化未生成，已保留教师原始审校（L1）。")
+        if st.button(
+            "手动确认 L1 作为 L2",
+            key=f"manual_l2_v2_{selected_id}_{para_id}",
+        ):
+            storage.save_l2_review(
+                None,
+                record["id"],
+                llm_raw_normalized_response="（手动）",
+                normalized_review={
+                    "decision": record.get("teacher_decision"),
+                    "error_types": record.get("teacher_error_types") or [],
+                    "severity": record.get("teacher_severity") or "null",
+                    "teacher_revision": record.get("teacher_revision") or "",
+                    "teacher_raw_comment": record.get("teacher_raw_comment") or "",
+                    "normalized_comment": record.get("teacher_raw_comment") or "",
+                    "translation_standards": [],
+                    "term_changes": [],
+                    "has_conflict": False,
+                    "conflict_fields": [],
+                    "conflict_explanation": "",
+                },
+                llm_model="manual",
+                prompt_version="manual",
+                normalized_status="manual",
+            )
+            st.rerun()
+
+
 def render_history() -> None:
-    """渲染历史记录区：选择运行、查看详情、保存人工译文与审校意见。"""
+    """渲染历史记录区：选择运行、查看详情、逐段教师审校与确认。"""
     st.subheader("历史记录")
     try:
         runs = storage.list_runs(None)
@@ -480,116 +629,62 @@ def render_history() -> None:
         st.markdown("**审校报告：**")
         st.markdown(details["run"]["report"])
 
-    # ---- 段落详情与人工译文 ----
-    st.markdown("### 段落结果与人工最终译文")
+    # ---- 段落结果与教师审校 ----
+    st.markdown("### 段落结果与教师审校")
     for p in details["paragraphs"]:
-        st.markdown(f"**第 {p['paragraph_index'] + 1} 段（阿语）**")
-        st.write(p["source_text"])
-        st.caption(
-            f"API：{p.get('api_translation') or '无'} ｜ "
-            f"直接：{p.get('llm_direct_translation') or '无'} ｜ "
-            f"修正：{p.get('llm_corrected_translation') or '无'} ｜ "
-            f"最终：{p.get('llm_final_translation') or '无'} ｜ "
-            f"人工：{p.get('human_final_translation') or '无'}"
-        )
-        current_value = p.get("human_final_translation") or p.get("llm_final_translation") or ""
-        human_text = st.text_area(
-            f"人工译文（第 {p['paragraph_index'] + 1} 段）",
-            value=current_value,
-            key=f"human_{selected_id}_{p['paragraph_id']}",
-        )
-        if st.button("保存人工译文", key=f"save_human_{selected_id}_{p['paragraph_id']}"):
-            storage.save_human_translation(None, selected_id, p["paragraph_id"], human_text)
-            st.success("已保存人工译文。")
+        para_id = p["paragraph_id"]
+        idx = p["paragraph_index"]
+        st.markdown(f"**第 {idx + 1} 段（阿语）**")
+        safe_source = html.escape(p["source_text"]).replace("\n", "<br>")
+        st.markdown(f'<div class="ar-para">{safe_source}</div>', unsafe_allow_html=True)
 
-        # 分段审校意见
-        para_note_content = st.text_area(
-            f"分段审校意见（第 {p['paragraph_index'] + 1} 段）",
-            key=f"para_note_{selected_id}_{p['paragraph_id']}",
-        )
-        if st.button("保存分段审校意见", key=f"save_para_note_{selected_id}_{p['paragraph_id']}"):
-            if para_note_content.strip():
-                storage.save_review_note(
-                    None,
-                    selected_id,
-                    para_note_content,
-                    note_type="other",
-                    paragraph_id=p["paragraph_id"],
-                )
-                st.success("已保存分段审校意见。")
-            else:
-                st.warning("分段意见内容不能为空。")
-
-        # ---- 教师审校工作流（L1 → L2 → L3）----
-        st.markdown(f"#### 教师审校：第 {p['paragraph_index'] + 1} 段")
+        # 当前 AI 译文（只读）：优先最终仲裁结果，兼容旧数据
         draft_translation = p.get("llm_final_translation") or p.get("human_final_translation") or ""
-        latest_record = storage.get_latest_review_record(
-            None, selected_id, p["paragraph_id"]
-        )
+        st.markdown("**当前 AI 译文（只读）**")
+        if draft_translation:
+            st.markdown(f'<div class="zh-trans">{html.escape(draft_translation)}</div>', unsafe_allow_html=True)
+        else:
+            st.caption("暂无译文。")
+
+        # 四个候选译文折叠展示，不默认展开
+        with st.expander("参考译文（只读）", expanded=False):
+            for label, value in [
+                ("原始 API 译文", p.get("api_translation")),
+                ("LLM 直接翻译结果", p.get("llm_direct_translation")),
+                ("LLM 修正结果", p.get("llm_corrected_translation")),
+                ("LLM 最终结果（以原文为准）", p.get("llm_final_translation")),
+                ("人工最终译文（旧数据）", p.get("human_final_translation")),
+            ]:
+                st.markdown(f"**{label}**")
+                st.write(value or "无")
+
+        latest_record = storage.get_latest_review_record(None, selected_id, para_id)
         if latest_record is None:
-            # L1 提交表单
+            # ---- 一个翻译单元的轻度表单 ----
+            st.markdown(f"#### 提交本段审校（第 {idx + 1} 段）")
             teacher_decision_label = st.radio(
                 "审校结论",
                 ["pass", "revise", "retranslate"],
-                format_func=lambda x: {"pass": "通过", "revise": "修改", "retranslate": "重译"}[x],
-                key=f"decision_{selected_id}_{p['paragraph_id']}",
-            )
-            teacher_error_types = st.multiselect(
-                "问题类型（可多选）",
-                ["semantic_mistranslation", "omission", "addition", "grammar",
-                 "reference", "proper_name_or_term", "style", "chinese_expression",
-                 "cultural_context", "footnote_or_note", "punctuation_or_format", "other"],
-                format_func=lambda x: {
-                    "semantic_mistranslation": "语义误译", "omission": "漏译",
-                    "addition": "增译", "grammar": "语法理解", "reference": "指代关系",
-                    "proper_name_or_term": "专名/术语", "style": "语体风格",
-                    "chinese_expression": "中文表达", "cultural_context": "文化背景",
-                    "footnote_or_note": "脚注/译者注", "punctuation_or_format": "标点/格式",
-                    "other": "其他",
-                }[x],
-                key=f"errors_{selected_id}_{p['paragraph_id']}",
-            )
-            teacher_custom_error_types = ""
-            if "other" in teacher_error_types:
-                teacher_custom_error_types = st.text_input(
-                    "其他问题归类（请填写你希望归类的审校类型）",
-                    key=f"other_error_{selected_id}_{p['paragraph_id']}",
-                )
-            teacher_severity = st.radio(
-                "严重程度",
-                ["minor", "moderate", "major", "null"],
-                format_func=lambda x: {
-                    "minor": "轻微", "moderate": "一般", "major": "严重", "null": "无问题",
-                }[x],
-                key=f"severity_{selected_id}_{p['paragraph_id']}",
+                format_func=lambda x: _decision_label(x),
+                key=f"decision_v2_{selected_id}_{para_id}",
             )
             teacher_revision = st.text_area(
-                "教师修改译文",
+                "最终译文（初始为当前 AI 译文；修改后作为教师最终译文）",
                 value=draft_translation,
-                key=f"teacher_revision_{selected_id}_{p['paragraph_id']}",
+                key=f"teacher_revision_v2_{selected_id}_{para_id}",
             )
             teacher_raw_comment = st.text_area(
-                "教师原始说明（可选）",
-                key=f"teacher_comment_{selected_id}_{p['paragraph_id']}",
+                "审校说明（可选）",
+                key=f"teacher_comment_v2_{selected_id}_{para_id}",
             )
-            if st.button(
-                "提交教师审校",
-                key=f"submit_l1_{selected_id}_{p['paragraph_id']}",
-            ):
+            if st.button("提交本段审校", key=f"submit_l1_v2_{selected_id}_{para_id}"):
                 record_id = storage.create_review_record(
-                    None,
-                    selected_id,
-                    p["paragraph_id"],
-                    p["source_text"],
-                    draft_translation,
+                    None, selected_id, para_id, p["source_text"], draft_translation
                 )
                 storage.save_l1_review(
                     None,
                     record_id,
                     teacher_decision=teacher_decision_label,
-                    teacher_error_types=teacher_error_types,
-                    teacher_custom_error_types=teacher_custom_error_types,
-                    teacher_severity=teacher_severity,
                     teacher_revision=teacher_revision,
                     teacher_raw_comment=teacher_raw_comment,
                 )
@@ -598,10 +693,8 @@ def render_history() -> None:
                         p["source_text"],
                         draft_translation,
                         teacher_decision_label,
-                        teacher_error_types,
-                        teacher_severity,
-                        teacher_revision,
-                        teacher_raw_comment,
+                        teacher_revision=teacher_revision,
+                        teacher_raw_comment=teacher_raw_comment,
                     )
                     storage.save_l2_review(
                         None,
@@ -613,99 +706,16 @@ def render_history() -> None:
                         normalized_status=std["status"],
                     )
                 except Exception as e:  # noqa: BLE001
-                    # L1 已保存，LLM 失败不丢失教师数据
+                    # L1 已保存，LLM 失败不影响教师数据
                     st.warning(f"AI 标准化生成失败，已保留教师 L1：{e}")
-                st.success("教师审校已提交。")
+                st.success("本段审校已提交。")
                 st.rerun()
         else:
-            # 已有审校记录，展示 L1/L2/L3 状态
-            st.caption(
-                f"L1：{latest_record.get('teacher_decision') or '未提交'} ｜ "
-                f"L2：{latest_record.get('normalized_status') or '未生成'} ｜ "
-                f"verified：{'是' if latest_record.get('verified') else '否'}"
-            )
-            if latest_record.get("teacher_raw_comment"):
-                st.markdown(f"**教师原始说明：** {latest_record['teacher_raw_comment']}")
-            if latest_record.get("teacher_custom_error_types"):
-                st.markdown(
-                    f"**其他问题归类：** {latest_record['teacher_custom_error_types']}"
-                )
-            normalized = latest_record.get("normalized_review") or {}
-            if normalized:
-                st.markdown("**AI 整理后的审校意见：**")
-                st.write(normalized)
-                if not latest_record.get("verified"):
-                    # 教师确认或修改后确认 L3
-                    confirm_revision = st.text_area(
-                        "确认后的审校内容（可修改）",
-                        value=json.dumps(normalized, ensure_ascii=False, indent=2),
-                        key=f"confirm_l2_{selected_id}_{p['paragraph_id']}",
-                    )
-                    if normalized.get("has_conflict"):
-                        st.warning(
-                            "检测到结构化字段与教师说明冲突，请先解决冲突后再确认。"
-                            f"冲突字段：{normalized.get('conflict_fields')}"
-                        )
-                    elif st.button(
-                        "确认（生成 L3）",
-                        key=f"confirm_l3_{selected_id}_{p['paragraph_id']}",
-                    ):
-                        try:
-                            confirmed = json.loads(confirm_revision)
-                        except Exception:  # noqa: BLE001
-                            confirmed = dict(normalized)
-                            confirmed["normalized_comment"] = confirm_revision
-                        storage.save_l3_verified(
-                            None,
-                            latest_record["id"],
-                            verified_review=confirmed,
-                            reviewer_id="teacher",
-                        )
-                        st.success("已确认，进入高质量审校库。")
-                        st.rerun()
-            else:
-                # AI 标准化失败，保留 L1，可由教师手动确认 L1 作为 L2
-                if st.button("手动确认 L1 作为 L2", key=f"manual_l2_{selected_id}_{p['paragraph_id']}"):
-                    storage.save_l2_review(
-                        None,
-                        latest_record["id"],
-                        llm_raw_normalized_response="（手动）",
-                        normalized_review={
-                            "decision": latest_record.get("teacher_decision"),
-                            "error_types": latest_record.get("teacher_error_types") or [],
-                            "severity": latest_record.get("teacher_severity"),
-                            "teacher_revision": latest_record.get("teacher_revision") or "",
-                            "teacher_raw_comment": latest_record.get("teacher_raw_comment") or "",
-                            "has_conflict": False,
-                            "conflict_fields": [],
-                            "conflict_explanation": "",
-                        },
-                        llm_model="manual",
-                        prompt_version="manual",
-                        normalized_status="manual",
-                    )
-                    st.rerun()
+            _render_teacher_review(latest_record, selected_id, para_id, p)
 
-
-    # ---- 全文审校意见 ----
-    st.markdown("### 保存全文审校意见")
-    note_type = st.selectbox(
-        "意见类型",
-        ["translation_error", "terminology", "fact_check", "style", "approved", "other"],
-        key=f"note_type_{selected_id}",
-    )
-    author = st.text_input("署名（可选）", key=f"author_{selected_id}")
-    note_content = st.text_area("意见内容", key=f"note_content_{selected_id}")
-    if st.button("保存全文审校意见", key=f"save_note_{selected_id}"):
-        if not note_content.strip():
-            st.warning("意见内容不能为空。")
-        else:
-            storage.save_review_note(None, selected_id, note_content, note_type=note_type, author=author)
-            st.success("已保存全文审校意见。")
-
-    # ---- 已保存意见 ----
+    # ---- 旧全文/分段意见只读展示（不再提供碎片保存表单） ----
     if details["notes"]:
-        st.markdown("### 已保存的审校意见")
+        st.markdown("### 已保存的审校意见（历史，只读）")
         para_index_map = {p["paragraph_id"]: p["paragraph_index"] for p in details["paragraphs"]}
         for n in details["notes"]:
             if n["paragraph_id"] is not None:

@@ -45,6 +45,14 @@
 - 历史记录：页面底部可查看历史运行、编辑人工最终译文、保存审校意见
 - 备份：直接复制 `data/translations.db` 即可；当前 SQLite 适合低并发 MVP，未来 PostgreSQL 需调整字段类型与迁移
 
+## 教师审校工作流（L1 / L2 / L3）
+
+- 每个翻译单元只显示：**原文（只读）、当前 AI 译文（只读）、一个“最终译文”编辑框、一个“审校结论”、一个可选“审校说明”、一次“提交本段审校”**
+- 不要求教师填写问题类型、严重程度或 JSON；后台自动推断并保存 L2 结构化结果
+- AI 原始译文（`draft_translation`）与教师原始说明（`teacher_raw_comment`）永远不被 AI 覆盖
+- L3 只有教师在“确认”或“修改并确认”后才生成 `verified=true`，未确认的 L2 不会进入高质量学习库
+- 历史保存：`review_records` 保留 `draft_translation`、`teacher_revision`、`teacher_raw_comment`、`translation_diff`、`normalized_review`、`verified_review`、`verified`、`revision` 等字段
+
 **本阶段明确不做**：登录权限、部署、PDF/Word、词边界判断（纯子串会命中派生词，如「فلسطين」会命中「الفلسطينية」，属已知取舍）、术语约束发送给阿里云（该 API 无 context 参数，约束文本仅生成，供 LLM 审校使用）、让 LLM 脱离原文另译全文、让 LLM 添加原文没有的信息。
 
 ## 目录结构

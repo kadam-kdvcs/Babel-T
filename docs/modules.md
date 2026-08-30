@@ -191,8 +191,9 @@ api 模式缺密钥时自动回退占位（不抛错）；调用失败（网络/
 
 **数据库路径**：默认 `data/translations.db`，可用环境变量 `DATABASE_PATH` 覆盖。
 
-**教师审校记录（阶段 4.1）**：新增 `review_records` 表，按 `(run_id, unit_id, revision)` 唯一，保存 L0/L1/L2/L3 与 `verified`。相关函数：
+**教师审校记录（阶段 4.1 / 4.2）**：新增 `review_records` 表，按 `(run_id, unit_id, revision)` 唯一，保存 L0/L1/L2/L3 与 `verified`。相关函数：
 `create_review_record` / `save_l1_review` / `save_l2_review` / `save_l3_verified` / `get_review_record` / `get_latest_review_record` / `list_review_records`。
+`save_l1_review` 已简化：问题类型/严重程度可选（不再要求教师手填），并自动根据 AI 原始译文与教师最终译文生成 `translation_diff`；`draft_translation` 与 `teacher_raw_comment` 保持不变。
 
 **调用方**：app.py 流水线与历史记录区。
 
@@ -213,8 +214,11 @@ api 模式缺密钥时自动回退占位（不抛错）；调用失败（网络/
 | `_load_sample()` | 无 | `str` | 读取 data/samples/politics_001.txt 预填输入框 |
 | `_hits_to_rows(hits, columns)` | 命中列表 + 要展示的列 | `list[dict]` 展示行 | 统一列序，供 st.dataframe 渲染 |
 | `render_results(results)` | run_pipeline 的结果 dict | 无（直接渲染页面） | 渲染「四结果对比/术语命中/专名命中/审校报告」；四结果固定展示：原始 API 译文、LLM 直接翻译、LLM 修正结果、LLM 最终结果 |
+| `render_history()` | 无 | 无 | 历史运行选择、逐段教师审校提交与确认 |
+| `_render_teacher_review(...)` | 审校记录/运行/段落 | 无 | 已提交记录的 L1 摘要、L2 自然语言意见、确认/修改/确认修改 |
+| `_render_natural_review(review)` | L2/L3 dict | 无 | 用自然语言展示审校结果，不显示 JSON |
 
-**页面布局**：标题 → 阿语输入框（预填样例）→ 「开始翻译与审校」按钮 → 四结果对比（阿语 RTL 右对齐；固定展示原始 API 译文 / LLM 直接翻译 / LLM 修正结果 / LLM 最终结果）→ 翻译取舍说明 → 术语命中表（六列）→ 专名命中表（四列）→ 审校报告区 → 历史记录区（查看历史运行、编辑人工译文、保存审校意见）。
+**页面布局**：标题 → 阿语输入框（预填样例）→ 「开始翻译与审校」按钮 → 四结果对比（阿语 RTL 右对齐；固定展示原始 API 译文 / LLM 直接翻译 / LLM 修正结果 / LLM 最终结果）→ 翻译取舍说明 → 术语命中表（六列）→ 专名命中表（四列）→ 审校报告区 → 历史记录区（选择运行、查看详情、逐段教师审校：原文+当前 AI 译文+最终译文+结论+说明+一次提交；参考译文折叠；确认/修改用自然语言）。
 
 **关键实现**：
 - 顶部 `load_dotenv(BASE_DIR / ".env")` 加载本地密钥（全项目唯一 import dotenv 处）

@@ -990,3 +990,86 @@ def test_parse_review_bundle_falls_back_on_wrong_count(monkeypatch):
     assert bundle["final_translations"] == ["修正A", "修正B"]
     assert "报告正文" in bundle["report"]
 
+
+# ---------------------------------------------------------------------------
+# 阶段 4.2 新增：L2 自动推断，不要求教师手填问题类型/严重程度
+# ---------------------------------------------------------------------------
+
+def test_standardized_review_mock_infers_metadata(monkeypatch):
+    """验证 mock 模式下 L2 自动推断问题类型/严重程度，并保留原始说明。"""
+    monkeypatch.setenv(settings.ENV_REVIEW_ENGINE, settings.MOCK_ENGINE)
+
+    def fake_post(*args, **kwargs):
+        raise AssertionError("mock 模式不应发起任何网络请求")
+
+    monkeypatch.setattr(reviewer.requests, "post", fake_post)
+
+    result = reviewer.generate_standardized_review(
+        "原文",
+        "AI原始译文",
+        "revise",
+        teacher_revision="教师修改稿",
+        teacher_raw_comment="这里漏译了一个词，中文也不顺",
+    )
+
+    assert result["status"] == "success"
+    normalized = result["normalized"]
+    assert "omission" in normalized["error_types"]
+    assert "chinese_expression" in normalized["error_types"]
+    assert normalized["teacher_revision"] == "教师修改稿"
+    # 关键不变量：teacher_raw_comment 必须原样保留
+    assert normalized["teacher_raw_comment"] == "这里漏译了一个词，中文也不顺"
+    assert normalized["severity"] in {"minor", "moderate", "major"}
+
+
+def test_standardized_review_api_uses_no_manual_type_placeholders(monkeypatch, tmp_path):
+    """验证 api 标准化只传 raw 字段，问题类型/严重程度由 LLM 推断。"""
+    _set_api_review_env(monkeypatch)
+    std_path = tmp_path / "std.md"
+    std_path.write_text(
+        "# 测试\n## 系统消息\n标准化助手。\n## 用户消息\n"
+        "原文：{source_text}\nAI：{draft_translation}\n"
+        "结论：{teacher_decision}\n修改：{teacher_revision}\n说明：{teacher_raw_comment}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(reviewer, "_STANDARDIZED_PROMPT_PATH", std_path)
+
+    content = (
+        '{"decision":"revise","error_types":["omission"],"severity":"moderate",'
+        '"teacher_revision":"教师改","teacher_raw_comment":"漏译",'
+        '"problem_summary":"漏译","revision_instruction":"","normalized_comment":"漏译",'
+        '"translation_standards":[],"term_changes":[],'
+        '"has_conflict":false,"conflict_fields":[],"conflict_explanation":""}'
+    )
+    fake_post, calls = _fixed_fake_post(
+        _FakeResponse(200, {"choices": [{"message": {"content": content}}]})
+    )
+    monkeypatch.setattr(reviewer.requests, "post", fake_post)
+
+    result = reviewer.generate_standardized_review(
+        "原文", "AI原始译文", "revise",
+        teacher_revision="教师改", teacher_raw_comment="漏译",
+    )
+    assert result["status"] == "success"
+    assert len(calls) == 1
+    user_message = calls[0]["json"]["messages"][1]["content"]
+    assert "{teacher_error_types}" not in user_message
+    assert "{teacher_severity}" not in user_message
+    assert result["normalized"]["teacher_raw_comment"] == "漏译"
+
+
+def test_standardized_review_keep_raw_comment_separate_from_inference(monkeypatch):
+    """验证 L2 推断结果不会把 teacher_raw_comment 覆盖成其他内容。"""
+    monkeypatch.setenv(settings.ENV_REVIEW_ENGINE, settings.MOCK_ENGINE)
+
+    result = reviewer.generate_standardized_review(
+        "原文",
+        "AI原始译文",
+        "pass",
+        teacher_revision="AI原始译文",
+        teacher_raw_comment="通过，没有意见",
+    )
+    normalized = result["normalized"]
+    assert normalized["teacher_raw_comment"] == "通过，没有意见"
+    assert normalized["problem_summary"] == "通过，没有意见"
+

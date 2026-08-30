@@ -69,8 +69,7 @@ _PLACEHOLDERS = ("source_paragraphs", "direct_translations", "corrected_translat
                  "term_hits", "name_hits")
 _STANDARDIZED_PLACEHOLDERS = (
     "source_text", "draft_translation", "teacher_decision",
-    "teacher_error_types", "teacher_severity", "teacher_revision",
-    "teacher_raw_comment",
+    "teacher_revision", "teacher_raw_comment",
 )
 
 # 模板分隔标记：程序按用户标记拆出用户消息段（占位符所在），
@@ -311,39 +310,40 @@ def generate_standardized_review(
     source_text: str,
     draft_translation: str,
     teacher_decision: str,
-    teacher_error_types: list[str],
-    teacher_severity: str,
-    teacher_revision: str,
-    teacher_raw_comment: str,
+    teacher_error_types: list[str] | None = None,
+    teacher_severity: str = "null",
+    teacher_revision: str = "",
+    teacher_raw_comment: str = "",
 ) -> dict:
     """生成 L2 AI 标准化审校。
 
-    作用：把教师 L1 结构化字段和原始说明交给 LLM，输出标准化审校 JSON。
+    作用：把教师原始审校（结论/最终译文/原始说明）交给 LLM，输出标准化
+    审校 JSON。教师不再需要手工填写“问题类型/严重程度”，由系统自动推断；
+    推断结果保存在 normalized_review（L2）中，与教师原始输入分开。
+
     返回 dict：
       - raw: LLM 原始响应
-      - normalized: 解析后的 L2 结构化 dict
+      - normalized: 解析后的 L2 结构化 dict（含推断的 error_types/severity）
       - model / prompt_version / status("success"|"failed")
     若 LLM 返回不是合法 JSON，status="failed" 且 raw 仍保留，L1 不受影响。
+
+    兼容说明：teacher_error_types / teacher_severity 参数保留仅供旧调用方
+    使用；新调用只需传 source / draft / decision / revision / raw_comment。
     """
     config = load_review_config()
+    # 基础推断：即使 mock、缺 key 或 LLM 解析失败，也能给出一份可读的 L2
+    inferred = _infer_standardized_review(
+        source_text,
+        draft_translation,
+        teacher_decision,
+        teacher_revision or "",
+        teacher_raw_comment or "",
+    )
+
     if config.engine == MOCK_ENGINE or not config.has_credentials:
-        normalized = {
-            "unit_id": None,
-            "decision": teacher_decision,
-            "error_types": list(teacher_error_types),
-            "severity": teacher_severity,
-            "problem_summary": "",
-            "revision_instruction": "",
-            "teacher_revision": teacher_revision,
-            "teacher_raw_comment": teacher_raw_comment,
-            "normalized_comment": teacher_raw_comment or "",
-            "has_conflict": False,
-            "conflict_fields": [],
-            "conflict_explanation": "",
-        }
         return {
             "raw": "（mock）标准化审校未调用真实 LLM。",
-            "normalized": normalized,
+            "normalized": inferred,
             "model": config.model,
             "prompt_version": "v1",
             "status": "success",
@@ -353,8 +353,6 @@ def generate_standardized_review(
         "source_text": source_text,
         "draft_translation": draft_translation,
         "teacher_decision": teacher_decision,
-        "teacher_error_types": ", ".join(teacher_error_types) if teacher_error_types else "（无）",
-        "teacher_severity": teacher_severity,
         "teacher_revision": teacher_revision or "",
         "teacher_raw_comment": teacher_raw_comment or "",
     }
@@ -364,22 +362,91 @@ def generate_standardized_review(
         _STANDARDIZED_PLACEHOLDERS,
         replacements,
     )
-    normalized, ok = _parse_standardized_review_json(
-        raw,
-        {
-            "decision": teacher_decision,
-            "error_types": list(teacher_error_types),
-            "severity": teacher_severity,
-            "teacher_revision": teacher_revision or "",
-            "teacher_raw_comment": teacher_raw_comment or "",
-        },
-    )
+    normalized, ok = _parse_standardized_review_json(raw, inferred)
     return {
         "raw": raw,
         "normalized": normalized,
         "model": config.model,
         "prompt_version": "v1",
         "status": "success" if ok else "failed",
+    }
+
+
+def _infer_standardized_review(
+    source_text: str,
+    draft_translation: str,
+    teacher_decision: str,
+    teacher_revision: str,
+    teacher_raw_comment: str,
+) -> dict:
+    """根据教师原始输入推断 L2 结构化字段（mock/解析失败时用）。
+
+    输入：原文、AI 原始译文、教师结论、教师最终译文、教师原始说明。
+    输出：标准 normalized_review dict。
+    注意：推断结果与 teacher_raw_comment 分开保存，绝不改写原始说明。
+    """
+    draft_text = draft_translation or ""
+    comment = teacher_raw_comment or ""
+    revision = teacher_revision or ""
+    has_change = bool(draft_text.strip()) and bool(revision.strip()) and revision.strip() != draft_text.strip()
+    combined = f"{comment}\n{revision}".strip()
+
+    error_types: list[str] = []
+    if any(key in combined for key in ("漏", "缺", "省略")):
+        error_types.append("omission")
+    if any(key in combined for key in ("错", "误", "语义", "理解")):
+        error_types.append("semantic_mistranslation")
+    if any(key in combined for key in ("不顺", "中文", "表达", "措辞", "语序")):
+        error_types.append("chinese_expression")
+    if any(key in combined for key in ("术语", "专名", "固定译法", "译名")):
+        error_types.append("proper_name_or_term")
+    if any(key in combined for key in ("风格", "语体", "语气")):
+        error_types.append("style")
+    if any(key in combined for key in ("文化", "背景")):
+        error_types.append("cultural_context")
+    if not error_types and (has_change or comment):
+        error_types = ["semantic_mistranslation"] if teacher_decision == "retranslate" else ["chinese_expression"]
+
+    if any(key in combined for key in ("完全", "彻底", "严重", "重译", "通篇")):
+        severity = "major"
+    elif any(key in combined for key in ("漏", "错", "误", "不顺", "问题")):
+        severity = "moderate"
+    elif has_change or comment:
+        severity = "minor"
+    else:
+        severity = "null"
+
+    if comment:
+        problem_summary = comment.strip()
+    elif has_change:
+        problem_summary = "教师修改了译文，请以教师最终译文为准。"
+    elif teacher_decision == "retranslate":
+        problem_summary = "教师要求重新翻译本段。"
+    else:
+        problem_summary = "教师判定通过。"
+    revision_instruction = ""
+    if has_change:
+        revision_instruction = "已保存教师最终译文，确认后作为可学习的最终结果。"
+    elif teacher_decision == "retranslate":
+        revision_instruction = "建议重新翻译本段后再提交审校。"
+    elif teacher_decision == "pass":
+        revision_instruction = "译文通过，无需修改。"
+
+    return {
+        "unit_id": None,
+        "decision": teacher_decision,
+        "error_types": error_types,
+        "severity": severity,
+        "problem_summary": problem_summary,
+        "revision_instruction": revision_instruction,
+        "teacher_revision": revision,
+        "teacher_raw_comment": comment,
+        "normalized_comment": comment or (problem_summary if problem_summary != "教师判定通过。" else ""),
+        "translation_standards": [],
+        "term_changes": [],
+        "has_conflict": False,
+        "conflict_fields": [],
+        "conflict_explanation": "",
     }
 
 
@@ -404,6 +471,8 @@ def _parse_standardized_review_json(content: str, fallback: dict) -> tuple[dict,
         data.setdefault("teacher_revision", fallback.get("teacher_revision", ""))
         data.setdefault("teacher_raw_comment", fallback.get("teacher_raw_comment", ""))
         data.setdefault("normalized_comment", "")
+        data.setdefault("translation_standards", [])
+        data.setdefault("term_changes", [])
         data.setdefault("has_conflict", False)
         data.setdefault("conflict_fields", [])
         data.setdefault("conflict_explanation", "")

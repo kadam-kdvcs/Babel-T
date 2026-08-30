@@ -7,7 +7,7 @@
 ## 技术栈与约束（不可擅自更改）
 
 - Python 3.13 + Streamlit + 标准库 csv（**不 import pandas**）+ requests + python-dotenv
-- 阶段 3 已接翻译 API（阿里云机器翻译 TranslateGeneral，RPC 手写 HMAC-SHA1 签名，双模式 mock/api）+ LLM 审校（DeepSeek OpenAI 兼容接口，requests 直调不引 SDK，双模式 mock/api，8 项报告结构）；阶段 4 已接入标准库 sqlite3 持久化（不引 ORM）
+- 阶段 3 已接翻译 API（阿里云机器翻译 TranslateGeneral，RPC 手写 HMAC-SHA1 签名，双模式 mock/api）+ LLM 审校（DeepSeek OpenAI 兼容接口，requests 直调不引 SDK，双模式 mock/api，8 项报告结构）；阶段 4 已接入标准库 sqlite3 持久化（不引 ORM）；历史页教师审校已简化为“原文/当前 AI 译文只读 + 最终译文 + 结论 + 可选说明 + 一次提交”，L2 自动推断、L3 人工确认后 verified
 - 不用 React/Vue/FastAPI/Django/Flask/Dify；不做登录权限、部署、PDF/Word
 - API Key 绝不写入代码；需要时用 .env / 环境变量 + .env.example
 - 所有路径相对路径；所有 open() 显式 encoding="utf-8" / "utf-8-sig"；CSV 必须 newline=""
@@ -71,7 +71,7 @@ docs/                       # meeting_notes.md 决策记录、modules.md 模块�
 - LLM 三轮处理：**三次独立调用**，每次使用独立提示词模板；直接翻译上下文不提供 API 译文，最终仲裁上下文不提供 API 译文；输出：`## 直接翻译结果` / `## API译文修正结果` / `## 最终结果` / `## 翻译取舍说明` / `## 审校报告`
 - 最终仲裁以原文为最高依据，禁止添加原文未有的信息
 - SQLite 持久化：标准库 sqlite3，默认 data/translations.db；保存文档/段落/运行/四种译文/人工译文/审校意见
-- 历史记录：页面可查看历史运行、编辑并保存人工最终译文、保存全文与分段审校意见
+- 历史记录：页面可查看历史运行、逐段教师审校（原文/当前 AI 译文只读 + 最终译文 + 结论 + 可选说明 + 一次提交）；L2 自动推断、L3 人工确认后 verified；后台继续保存人工译文/全文意见等完整数据
 - 安全：真实密钥仅放本地 .env（gitignored），绝不进代码/README/测试/日志；数据库不存密钥
 
-阶段 1/2/3/3.1/3.2/4 已全部完成（本地流水线 + 双模式翻译 + LLM 多结果仲裁与审校 + SQLite 持久化 + 118 测试 + 文档）。详细决策见 docs/meeting_notes.md。
+阶段 1/2/3/3.1/3.2/4/4.1/4.2 已全部完成（本地流水线 + 双模式翻译 + LLM 多结果仲裁与审校 + SQLite 持久化 + 教师审校简化 + 129 测试 + 文档）。详细决策见 docs/meeting_notes.md。

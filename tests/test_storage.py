@@ -274,6 +274,92 @@ def test_l2_save_does_not_overwrite_l1(tmp_path):
     assert rec["normalized_review"]["decision"] == "revise"
 
 
+def test_l1_save_without_technical_fields_saves_diff(tmp_path):
+    """验证新简化 L1：不要求问题类型/严重程度，自动保存修改差异。"""
+    db = _db(tmp_path)
+    doc_id = storage.create_document(db, "doc", "原文")
+    para_ids = storage.save_paragraphs(db, doc_id, ["原文"])
+    run_id = storage.create_translation_run(db, doc_id, "mock", "mock")
+    rec_id = storage.create_review_record(db, run_id, para_ids[0], "原文", "AI原译文")
+
+    storage.save_l1_review(
+        db, rec_id,
+        teacher_decision="revise",
+        teacher_revision="教师修改稿",
+        teacher_raw_comment="漏译了一个词",
+    )
+
+    rec = storage.get_review_record(db, rec_id)
+    assert rec["draft_translation"] == "AI原译文"
+    assert rec["teacher_revision"] == "教师修改稿"
+    assert rec["teacher_raw_comment"] == "漏译了一个词"
+    assert rec["teacher_error_types"] == []
+    assert rec["teacher_severity"] == "null"
+    assert "AI 原始译文：AI原译文" in (rec["translation_diff"] or "")
+    assert "教师最终译文：教师修改稿" in (rec["translation_diff"] or "")
+
+
+def test_l1_save_pass_without_change_has_no_diff(tmp_path):
+    """验证“通过且未修改”时 translation_diff 为空。"""
+    db = _db(tmp_path)
+    doc_id = storage.create_document(db, "doc", "原文")
+    para_ids = storage.save_paragraphs(db, doc_id, ["原文"])
+    run_id = storage.create_translation_run(db, doc_id, "mock", "mock")
+    rec_id = storage.create_review_record(db, run_id, para_ids[0], "原文", "AI原译文")
+
+    storage.save_l1_review(
+        db, rec_id,
+        teacher_decision="pass",
+        teacher_revision="AI原译文",
+        teacher_raw_comment="",
+    )
+
+    rec = storage.get_review_record(db, rec_id)
+    assert rec["teacher_revision"] == "AI原译文"
+    assert rec["translation_diff"] == ""
+
+
+def test_retranslate_l1_preserves_draft_and_raw_comment(tmp_path):
+    """验证重译结论仍保留 AI 原始译文与教师原始说明。"""
+    db = _db(tmp_path)
+    doc_id = storage.create_document(db, "doc", "原文")
+    para_ids = storage.save_paragraphs(db, doc_id, ["原文"])
+    run_id = storage.create_translation_run(db, doc_id, "mock", "mock")
+    rec_id = storage.create_review_record(db, run_id, para_ids[0], "原文", "AI原译文")
+
+    storage.save_l1_review(
+        db, rec_id,
+        teacher_decision="retranslate",
+        teacher_revision="",
+        teacher_raw_comment="请整段重译，目前意思完全不对",
+    )
+
+    rec = storage.get_review_record(db, rec_id)
+    assert rec["draft_translation"] == "AI原译文"
+    assert rec["teacher_decision"] == "retranslate"
+    assert rec["teacher_raw_comment"] == "请整段重译，目前意思完全不对"
+
+
+def test_missing_l2_does_not_auto_verified(tmp_path):
+    """验证 L2 失败/未生成时，记录保持未确认且不可进入 verified。"""
+    db = _db(tmp_path)
+    doc_id = storage.create_document(db, "doc", "原文")
+    para_ids = storage.save_paragraphs(db, doc_id, ["原文"])
+    run_id = storage.create_translation_run(db, doc_id, "mock", "mock")
+    rec_id = storage.create_review_record(db, run_id, para_ids[0], "原文", "AI")
+
+    storage.save_l1_review(
+        db, rec_id,
+        teacher_decision="revise",
+        teacher_revision="教师改",
+        teacher_raw_comment="AI 标准化未调用",
+    )
+    rec = storage.get_review_record(db, rec_id)
+    assert rec["normalized_review"] == {}
+    assert rec["normalized_status"] is None
+    assert rec["verified"] is False
+
+
 def test_l3_verified_and_not_auto_verified(tmp_path):
     """验证只有教师确认后才 verified=true。"""
     db = _db(tmp_path)

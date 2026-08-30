@@ -295,6 +295,28 @@
 
 ---
 
+## 阶段 4.2（2026-08-30）：教师审校界面简化 + L2 自动推断
+
+**目标**：教师和开发者使用历史审校页时，不需要填写大量技术字段；一个翻译单元只保留“原文 / 当前 AI 译文 / 最终译文 / 审校结论 / 审校说明 / 一次提交”；后台继续完整保存 API/LLM/人工/教师原始/标准化/确认结果。
+
+### 新增/主要改动
+
+| 文件 | 改动 |
+|---|---|
+| `modules/storage.py` | `save_l1_review` 的问题类型/严重程度改为可选；自动根据 `draft_translation` 与 `teacher_revision` 生成 `translation_diff`；不覆盖 draft / teacher_raw_comment |
+| `modules/reviewer.py` | `generate_standardized_review` 不再要求教师手填问题类型/严重程度；新增 `_infer_standardized_review`，mock/解析失败时也能推断 L2；保留 `teacher_raw_comment` 原样 |
+| `prompts/standardized_review_prompt.md` | 去掉“教师问题类型/严重程度”输入，改为由 AI 根据教师结论、修改稿、原始说明自动推断；输出新增 `translation_standards` / `term_changes` |
+| `app.py` | 历史页每段重构为“原文只读 + 当前 AI 译文只读 + 参考译文折叠 + 一个最终译文 + 一个结论 + 一个说明 + 提交本段审校”；去掉人工译文/分段意见/全文意见碎片表单；L2/L3 用自然语言展示，不显示 JSON；确认/修改两按钮；修改时只出现普通文本编辑框 |
+| `tests/test_storage.py` | 新增 4 条：简化 L1 不传技术字段 + 自动 diff；通过未修改 diff 为空；重译保留 draft/raw；L2 失败不自动 verified |
+| `tests/test_reviewer.py` | 新增 3 条：mock L2 自动推断问题类型/严重程度；teacher_raw_comment 与推断结果分离；api 提示词不再要求手工类型/严重度 |
+
+### 验证
+
+- 全量测试：**129 passed**（原 122 + 新增 7）
+- Streamlit AppTest 冒烟：提交本段审校后出现“确认/修改”，无 JSON 编辑框；确认后 verified=true；修改流程打开普通文本编辑框；无页面异常
+
+---
+
 ## 远期备选（当前暂缓）：Web 前后端分离重构
 
 > 用户明确指示：**当前先不推进前端重构计划**。此节仅作为远期技术备选记录，不作为下一步执行计划。
