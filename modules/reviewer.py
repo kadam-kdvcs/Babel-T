@@ -60,12 +60,18 @@ _PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 _DIRECT_PROMPT_PATH = _PROMPT_DIR / "direct_translation_prompt.md"
 _CORRECT_PROMPT_PATH = _PROMPT_DIR / "correct_translation_prompt.md"
 _PROMPT_PATH = _PROMPT_DIR / "review_report_prompt.md"  # 保留旧兼容名，实际指最终仲裁模板
+_STANDARDIZED_PROMPT_PATH = _PROMPT_DIR / "standardized_review_prompt.md"
 
 # 各阶段模板的占位符（写进模板时用花括号包住，如 {source_paragraphs}）
 _DIRECT_PLACEHOLDERS = ("source_paragraphs", "term_hits", "name_hits")
 _CORRECT_PLACEHOLDERS = ("source_paragraphs", "translations", "term_hits", "name_hits")
 _PLACEHOLDERS = ("source_paragraphs", "direct_translations", "corrected_translations",
                  "term_hits", "name_hits")
+_STANDARDIZED_PLACEHOLDERS = (
+    "source_text", "draft_translation", "teacher_decision",
+    "teacher_error_types", "teacher_severity", "teacher_revision",
+    "teacher_raw_comment",
+)
 
 # 模板分隔标记：程序按用户标记拆出用户消息段（占位符所在），
 # 按系统标记截取系统消息段（去掉文件头部的维护者说明）。
@@ -160,45 +166,34 @@ def generate_review_report(
     return generate_review_bundle(paragraphs, translations, term_hits, name_hits)["report"]
 
 
-def generate_review_bundle(
+def generate_direct_translations(
     paragraphs: list[str],
-    translations: list[str],
-    term_hits: list[dict],
-    name_hits: list[dict],
+    term_hits: list[dict] | None = None,
+    name_hits: list[dict] | None = None,
+    fallback_translations: list[str] | None = None,
 ) -> dict:
-    """生成「直接翻译 / 修正 / 最终仲裁 / 审校报告」结果包（双模式入口）。
+    """LLM 直接翻译原文（独立公开入口，供阶段 4 逐步保存）。
 
-    作用：api 模式下分三次独立 LLM 调用，各阶段只携带本阶段必要输入：
-          1. 直接翻译：只输入原文 + 术语/专名命中，**不提供 API 译文**；
-          2. 修正：输入原文 + API 译文 + 术语/专名命中；
-          3. 最终仲裁：输入原文 + 直接翻译 + 修正结果 + 术语/专名命中，
-             不提供 API 译文；输出最终结果 + 翻译取舍说明 + 审校报告。
-          这样避免“直接翻译”受 API 译文上下文污染，也保证各阶段职责单一。
-    输入：paragraphs —— list[str]，阿语段落列表；
-          translations —— list[str]，与段落一一对应的原始 API 译文列表；
-          term_hits / name_hits —— 术语/专名命中列表。
-    输出：dict —— 含 report / direct_translations / corrected_translations /
-          final_translations / tradeoff_notes。
-    异常：api 模式任一阶段失败（网络/业务/解析）抛对应 ReviewError
-          子类；模板缺失抛 FileNotFoundError；环境变量非法抛 ValueError。
+    输入：paragraphs —— 阿语段落；term_hits / name_hits —— 命中列表。
+    输出：dict：
+          - translations: list[str]
+          - degraded: bool（True 表示解析失败回退到 API 译文）
     """
-    # 空输入短路：不加载配置、不发请求（契约：api 模式也如此）
     if not paragraphs:
-        return _generate_mock_bundle(paragraphs, translations, term_hits, name_hits)
-
-    # 加载审校配置（读取环境变量；非法值在此抛 ValueError，由 UI 层提示）
+        return {"translations": [], "degraded": False}
     config = load_review_config()
-
-    # 回退条件：mock 模式本来就不联网；api 模式缺密钥也回退占位数据
     if config.engine == MOCK_ENGINE or not config.has_credentials:
-        return _generate_mock_bundle(paragraphs, translations, term_hits, name_hits)
+        return {
+            "translations": [
+                f"（占位直接翻译·第{i + 1}段）待接入 LLM 直接翻译"
+                for i in range(len(paragraphs))
+            ],
+            "degraded": False,
+        }
 
-    # ---- API 模式：三步独立调用 ----
     hits_text = _format_hits_text(term_hits, name_hits)
     source_text = _format_numbered(paragraphs, "段")
-
-    # 第一步：直接翻译原文（不含 API 译文）
-    direct_content = _call_llm(
+    content = _call_llm(
         config,
         _DIRECT_PROMPT_PATH,
         _DIRECT_PLACEHOLDERS,
@@ -208,12 +203,43 @@ def generate_review_bundle(
             "name_hits": hits_text,
         },
     )
-    direct_translations = _parse_numbered_translations(
-        direct_content, paragraphs, translations
+    translations, degraded = _parse_numbered_translations_with_status(
+        content, paragraphs, fallback_translations or []
     )
+    # 若解析失败，兜底应使用 API 译文；这里由调用方传入，下面不能直接得到 API，
+    # 因此这里用空列表的兜底只在无 API 译文时有意义。实际 bundle 流程中，
+    # pipeline 会在回调前把 API 译文传进来，本公开函数保持简单抛回原始退化。
+    if degraded and not translations:
+        # 没有兜底可回退时保留占位（正常情况下 bundle 会覆盖）
+        translations = [f"（降级·第{i + 1}段）待人工复核" for i in range(len(paragraphs))]
+    return {"translations": translations, "degraded": degraded}
 
-    # 第二步：基于“原文 + API 译文”修正
-    corrected_content = _call_llm(
+
+def generate_corrected_translations(
+    paragraphs: list[str],
+    translations: list[str],
+    term_hits: list[dict] | None = None,
+    name_hits: list[dict] | None = None,
+) -> dict:
+    """LLM 基于“原文 + API 译文”修正（独立公开入口）。
+
+    输出：dict —— translations / degraded。
+    """
+    if not paragraphs:
+        return {"translations": [], "degraded": False}
+    config = load_review_config()
+    if config.engine == MOCK_ENGINE or not config.has_credentials:
+        return {
+            "translations": [
+                f"（占位修正译文·第{i + 1}段）待接入 LLM 修正"
+                for i in range(len(paragraphs))
+            ],
+            "degraded": False,
+        }
+
+    hits_text = _format_hits_text(term_hits, name_hits)
+    source_text = _format_numbered(paragraphs, "段")
+    content = _call_llm(
         config,
         _CORRECT_PROMPT_PATH,
         _CORRECT_PLACEHOLDERS,
@@ -224,12 +250,48 @@ def generate_review_bundle(
             "name_hits": hits_text,
         },
     )
-    corrected_translations = _parse_numbered_translations(
-        corrected_content, paragraphs, translations
+    corrected, degraded = _parse_numbered_translations_with_status(
+        content, paragraphs, translations
     )
+    return {"translations": corrected, "degraded": degraded}
 
-    # 第三步：最终仲裁 + 取舍说明 + 审校报告（不含 API 译文）
-    final_content = _call_llm(
+
+def generate_final_arbitration(
+    paragraphs: list[str],
+    direct_translations: list[str],
+    corrected_translations: list[str],
+    term_hits: list[dict] | None = None,
+    name_hits: list[dict] | None = None,
+) -> dict:
+    """LLM 最终仲裁 + 取舍说明 + 审校报告（独立公开入口）。
+
+    输出：dict —— final_translations / tradeoff_notes / report /
+          final_degraded / tradeoff_degraded。
+    """
+    if not paragraphs:
+        return {
+            "final_translations": [],
+            "tradeoff_notes": "",
+            "report": "",
+            "final_degraded": False,
+            "tradeoff_degraded": False,
+        }
+    config = load_review_config()
+    if config.engine == MOCK_ENGINE or not config.has_credentials:
+        return {
+            "final_translations": [
+                f"（占位最终结果·第{i + 1}段）待接入 LLM 仲裁"
+                for i in range(len(paragraphs))
+            ],
+            "tradeoff_notes": "（占位）翻译取舍说明：待接入 LLM 最终仲裁后生成。",
+            "report": _generate_mock_report(paragraphs, term_hits or [], name_hits or []),
+            "final_degraded": False,
+            "tradeoff_degraded": False,
+        }
+
+    hits_text = _format_hits_text(term_hits, name_hits)
+    source_text = _format_numbered(paragraphs, "段")
+    content = _call_llm(
         config,
         _PROMPT_PATH,
         _PLACEHOLDERS,
@@ -241,11 +303,176 @@ def generate_review_bundle(
             "name_hits": hits_text,
         },
     )
-    bundle = _parse_review_bundle(final_content, paragraphs, corrected_translations)
-    bundle["direct_translations"] = direct_translations
-    bundle["corrected_translations"] = corrected_translations
+    return _parse_review_bundle(content, paragraphs, corrected_translations)
+
+
+
+def generate_standardized_review(
+    source_text: str,
+    draft_translation: str,
+    teacher_decision: str,
+    teacher_error_types: list[str],
+    teacher_severity: str,
+    teacher_revision: str,
+    teacher_raw_comment: str,
+) -> dict:
+    """生成 L2 AI 标准化审校。
+
+    作用：把教师 L1 结构化字段和原始说明交给 LLM，输出标准化审校 JSON。
+    返回 dict：
+      - raw: LLM 原始响应
+      - normalized: 解析后的 L2 结构化 dict
+      - model / prompt_version / status("success"|"failed")
+    若 LLM 返回不是合法 JSON，status="failed" 且 raw 仍保留，L1 不受影响。
+    """
+    config = load_review_config()
+    if config.engine == MOCK_ENGINE or not config.has_credentials:
+        normalized = {
+            "unit_id": None,
+            "decision": teacher_decision,
+            "error_types": list(teacher_error_types),
+            "severity": teacher_severity,
+            "problem_summary": "",
+            "revision_instruction": "",
+            "teacher_revision": teacher_revision,
+            "teacher_raw_comment": teacher_raw_comment,
+            "normalized_comment": teacher_raw_comment or "",
+            "has_conflict": False,
+            "conflict_fields": [],
+            "conflict_explanation": "",
+        }
+        return {
+            "raw": "（mock）标准化审校未调用真实 LLM。",
+            "normalized": normalized,
+            "model": config.model,
+            "prompt_version": "v1",
+            "status": "success",
+        }
+
+    replacements = {
+        "source_text": source_text,
+        "draft_translation": draft_translation,
+        "teacher_decision": teacher_decision,
+        "teacher_error_types": ", ".join(teacher_error_types) if teacher_error_types else "（无）",
+        "teacher_severity": teacher_severity,
+        "teacher_revision": teacher_revision or "",
+        "teacher_raw_comment": teacher_raw_comment or "",
+    }
+    raw = _call_llm(
+        config,
+        _STANDARDIZED_PROMPT_PATH,
+        _STANDARDIZED_PLACEHOLDERS,
+        replacements,
+    )
+    normalized, ok = _parse_standardized_review_json(
+        raw,
+        {
+            "decision": teacher_decision,
+            "error_types": list(teacher_error_types),
+            "severity": teacher_severity,
+            "teacher_revision": teacher_revision or "",
+            "teacher_raw_comment": teacher_raw_comment or "",
+        },
+    )
+    return {
+        "raw": raw,
+        "normalized": normalized,
+        "model": config.model,
+        "prompt_version": "v1",
+        "status": "success" if ok else "failed",
+    }
+
+
+def _parse_standardized_review_json(content: str, fallback: dict) -> tuple[dict, bool]:
+    """从 LLM 返回文本中提取 JSON 对象；失败时返回 fallback 和 False。"""
+    import json
+    # 找到第一个 { 和最后一个 }，尽量兼容模型附带说明文字
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return fallback, False
+    try:
+        data = json.loads(content[start:end + 1])
+        if not isinstance(data, dict):
+            return fallback, False
+        # 确保关键字段存在
+        data.setdefault("decision", fallback.get("decision"))
+        data.setdefault("error_types", fallback.get("error_types", []))
+        data.setdefault("severity", fallback.get("severity"))
+        data.setdefault("problem_summary", "")
+        data.setdefault("revision_instruction", "")
+        data.setdefault("teacher_revision", fallback.get("teacher_revision", ""))
+        data.setdefault("teacher_raw_comment", fallback.get("teacher_raw_comment", ""))
+        data.setdefault("normalized_comment", "")
+        data.setdefault("has_conflict", False)
+        data.setdefault("conflict_fields", [])
+        data.setdefault("conflict_explanation", "")
+        return data, True
+    except (ValueError, TypeError):
+        return fallback, False
+
+
+
+def generate_review_bundle(
+    paragraphs: list[str],
+    translations: list[str],
+    term_hits: list[dict],
+    name_hits: list[dict],
+) -> dict:
+    """生成「直接翻译 / 修正 / 最终仲裁 / 审校报告」结果包（双模式入口）。
+
+    作用：按三个阶段公共函数依次执行，并汇总返回；保持旧调用兼容。
+    """
+    if not paragraphs:
+        return _generate_mock_bundle(paragraphs, translations, term_hits, name_hits)
+
+    direct_result = generate_direct_translations(
+        paragraphs, term_hits, name_hits, fallback_translations=translations
+    )
+    corrected_result = generate_corrected_translations(
+        paragraphs, translations, term_hits, name_hits
+    )
+    final_result = generate_final_arbitration(
+        paragraphs,
+        direct_result["translations"],
+        corrected_result["translations"],
+        term_hits,
+        name_hits,
+    )
+
+    bundle = {
+        "report": final_result.get("report", ""),
+        "direct_translations": direct_result["translations"],
+        "direct_degraded": direct_result.get("degraded", False),
+        "corrected_translations": corrected_result["translations"],
+        "corrected_degraded": corrected_result.get("degraded", False),
+        "final_translations": final_result.get("final_translations", []),
+        "final_degraded": final_result.get("final_degraded", False),
+        "tradeoff_notes": final_result.get("tradeoff_notes", ""),
+        "tradeoff_degraded": final_result.get("tradeoff_degraded", False),
+    }
     return bundle
 
+
+def _parse_numbered_translations_with_status(
+    text: str, paragraphs: list[str], fallback: list[str]
+) -> tuple[list[str], bool]:
+    """解析某轮译文，并返回“是否发生了降级回退”。
+
+    作用：与 _parse_numbered_translations 相同，但额外返回布尔值，
+          供阶段 4 明确标注降级结果。
+    """
+    pattern = re.compile(
+        r"第(\d+)段[:：](.*?)(?=\n\s*第\d+段[:：]|\n\s*## |\Z)", re.S
+    )
+    matches = pattern.findall(text)
+    if len(matches) != len(paragraphs):
+        return list(fallback), True
+    result = []
+    for number_str, segment in matches:
+        clean = re.sub(r"[*_#>`]", "", segment).strip()
+        result.append(clean)
+    return result, False
 
 def _generate_mock_bundle(
     paragraphs: list[str],
@@ -314,25 +541,31 @@ def _parse_review_bundle(
         return {
             "report": content.strip(),
             "final_translations": list(corrected_translations),
+            "final_degraded": True,
             "tradeoff_notes": "（缺省）模型未输出翻译取舍说明，请人工复核直接翻译与修正结果。",
+            "tradeoff_degraded": True,
         }
 
     # 最终结果：在“## 最终结果”到“## 翻译取舍说明”/“## 审校报告”之间
     final_text = _section_text(_FINAL_SECTION_MARKER, _TRADEOFF_SECTION_MARKER)
     if final_text is None:
         final_text = _section_text(_FINAL_SECTION_MARKER, _REPORT_SECTION_MARKER)
-    final_translations = (
-        _parse_numbered_translations(final_text, paragraphs, corrected_translations)
-        if final_text is not None
-        else list(corrected_translations)
-    )
+    if final_text is not None:
+        final_translations, final_degraded = _parse_numbered_translations_with_status(
+            final_text, paragraphs, corrected_translations
+        )
+    else:
+        final_translations = list(corrected_translations)
+        final_degraded = True
 
     # 翻译取舍说明：在“## 翻译取舍说明”到“## 审校报告”之间
     tradeoff_text = _section_text(_TRADEOFF_SECTION_MARKER, _REPORT_SECTION_MARKER)
-    if tradeoff_text is not None:
+    if tradeoff_text is not None and tradeoff_text.strip():
         tradeoff_notes = tradeoff_text.strip()
+        tradeoff_degraded = False
     else:
         tradeoff_notes = "（缺省）模型未输出翻译取舍说明，请人工复核直接翻译与修正结果。"
+        tradeoff_degraded = True
 
     # 审校报告：取“## 审校报告”之后全部内容
     if _REPORT_SECTION_MARKER in content:
@@ -343,7 +576,9 @@ def _parse_review_bundle(
     return {
         "report": report,
         "final_translations": final_translations,
+        "final_degraded": final_degraded,
         "tradeoff_notes": tradeoff_notes,
+        "tradeoff_degraded": tradeoff_degraded,
     }
 
 

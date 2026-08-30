@@ -7,7 +7,7 @@
 ## 技术栈与约束（不可擅自更改）
 
 - Python 3.13 + Streamlit + 标准库 csv（**不 import pandas**）+ requests + python-dotenv
-- 阶段 3 已接翻译 API（阿里云机器翻译 TranslateGeneral，RPC 手写 HMAC-SHA1 签名，双模式 mock/api）+ LLM 审校（DeepSeek OpenAI 兼容接口，requests 直调不引 SDK，双模式 mock/api，8 项报告结构）；暂不接 SQLite（第 4 阶段引入）
+- 阶段 3 已接翻译 API（阿里云机器翻译 TranslateGeneral，RPC 手写 HMAC-SHA1 签名，双模式 mock/api）+ LLM 审校（DeepSeek OpenAI 兼容接口，requests 直调不引 SDK，双模式 mock/api，8 项报告结构）；阶段 4 已接入标准库 sqlite3 持久化（不引 ORM）
 - 不用 React/Vue/FastAPI/Django/Flask/Dify；不做登录权限、部署、PDF/Word
 - API Key 绝不写入代码；需要时用 .env / 环境变量 + .env.example
 - 所有路径相对路径；所有 open() 显式 encoding="utf-8" / "utf-8-sig"；CSV 必须 newline=""
@@ -63,15 +63,15 @@ docs/                       # meeting_notes.md 决策记录、modules.md 模块�
 5. 需求不清楚先向用户提问，不擅自改技术路线
 6. 分阶段目标参见 README.md「路线图」
 
-## 当前阶段（第 3.2 阶段）已确认的决策
+## 当前阶段（第 4 阶段）已确认的决策
 
 - 翻译引擎：requests 手写阿里云 RPC 签名（不引 SDK）；mock/api 双模式由环境变量切换
 - 缺 key 回退占位（页面黄色提示），不崩溃；翻译失败（网络/业务/解析）中断整批并显示错误，旧结果保留
 - LLM 多结果：DeepSeek OpenAI 兼容接口（requests 直调，不引 openai SDK）；REVIEW_ENGINE=mock/api 双模式；api 缺 key 回退占位 + 黄条；调用失败抛 ReviewError 家族（页面红条、旧结果保留）
 - LLM 三轮处理：**三次独立调用**，每次使用独立提示词模板；直接翻译上下文不提供 API 译文，最终仲裁上下文不提供 API 译文；输出：`## 直接翻译结果` / `## API译文修正结果` / `## 最终结果` / `## 翻译取舍说明` / `## 审校报告`
 - 最终仲裁以原文为最高依据，禁止添加原文未有的信息
-- 审校报告 8 项结构（文本概况/术语命中与风险/专名命中与统一性/重点风险句段/语体与领域适配/文化政治语境提醒/总体结论/人工复核建议）；模板以「## 用户消息」为系统/用户消息分界；占位符校验针对用户段
-- 页面固定显示四结果对比：原始 API 译文 / LLM 直接翻译 / LLM 修正结果 / LLM 最终结果，并展示翻译取舍说明
-- 安全：真实密钥仅放本地 .env（gitignored），绝不进代码/README/测试/日志
+- SQLite 持久化：标准库 sqlite3，默认 data/translations.db；保存文档/段落/运行/四种译文/人工译文/审校意见
+- 历史记录：页面可查看历史运行、编辑并保存人工最终译文、保存全文与分段审校意见
+- 安全：真实密钥仅放本地 .env（gitignored），绝不进代码/README/测试/日志；数据库不存密钥
 
-阶段 1/2/3/3.1/3.2 已全部完成（本地流水线 + 双模式翻译 + LLM 多结果仲裁与审校 + 105 测试 + 文档）。详细决策见 docs/meeting_notes.md。
+阶段 1/2/3/3.1/3.2/4 已全部完成（本地流水线 + 双模式翻译 + LLM 多结果仲裁与审校 + SQLite 持久化 + 118 测试 + 文档）。详细决策见 docs/meeting_notes.md。

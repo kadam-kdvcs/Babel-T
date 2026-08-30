@@ -252,6 +252,49 @@
 
 ---
 
+## 阶段 4（2026-08-30）：SQLite 持久化 + 历史记录 + 人工审校
+
+**目标**：使用标准库 sqlite3 保存翻译审校任务；支持历史查看；支持人工最终译文编辑；支持全文/分段审校意见保存；页面重启后仍可读取历史。
+
+### 新增/主要改动
+
+| 文件 | 改动 |
+|---|---|
+| modules/storage.py | 占位模块实现为完整 SQLite 存储层：documents / paragraphs / translation_runs / paragraph_results / review_notes |
+| tests/test_storage.py | 新增 13 条存储层测试 |
+| modules/reviewer.py | 拆分出 `generate_direct_translations` / `generate_corrected_translations` / `generate_final_arbitration` 三个公开函数，供流水线逐步保存 |
+| app.py | 流水线增量保存：创建文档/段落/运行，每段 API 译文完成保存，LLM 每步完成保存，失败时更新 partial/failed；新增历史记录区、人工译文编辑、全文审校意见保存 |
+| .env.example | 新增 `DATABASE_PATH` |
+| README.md / CLAUDE.md / docs/modules.md | 阶段 4 说明 |
+
+### 阶段 4 验证
+
+- 全量测试：**118 passed**（原 105 + 存储层 13）
+- 数据库默认路径：`data/translations.db`
+
+---
+
+## 阶段 4.1（2026-08-30）：教师审校工作流 L1/L2/L3 + verified
+
+**目标**：在现有 SQLite 基础上新增教师审校界面、结构化审校记录、AI 标准化审校、教师确认流程。
+
+### 新增/主要改动
+
+| 文件 | 改动 |
+|---|---|
+| modules/storage.py | 新增 `review_records` 表和 L1/L2/L3、版本化、verified 相关函数 |
+| modules/reviewer.py | 新增 `generate_standardized_review`（L2 AI 标准化） |
+| prompts/standardized_review_prompt.md | 新增 L2 标准化提示词 |
+| app.py | 历史记录中增加教师审校工作流界面：L1 提交 → L2 展示 → 教师确认生成 L3 |
+| tests/test_storage.py | 新增 4 条教师审校记录测试 |
+
+### 验证
+
+- 全量测试：**122 passed**（原 105 + 存储 17）
+- mock 端到端验证：可提交 L1、生成 L2、确认 L3、verified=true
+
+---
+
 ## 远期备选（当前暂缓）：Web 前后端分离重构
 
 > 用户明确指示：**当前先不推进前端重构计划**。此节仅作为远期技术备选记录，不作为下一步执行计划。

@@ -168,13 +168,37 @@ api 模式缺密钥时自动回退占位（不抛错）；调用失败（网络/
 
 ---
 
-## modules/storage.py — 审校记录持久化（阶段 1 占位）
+## modules/storage.py — SQLite 持久化（阶段 4）
 
-**作用**：保存每次审校记录，供查询追溯。阶段 1 **不实现任何功能、不参与流水线**，仅保留文件与设计说明（SQLite 表结构示意：reviews(id, created_at, source_text, translations, term_hits, report)；未来函数 save_review / list_reviews）。
+**作用**：使用标准库 `sqlite3` 保存文档、段落、翻译运行、段落结果与审校意见。不依赖 Streamlit，不保存 API Key/Secret。
 
-**未来演化（阶段 4）**：实现 SQLite 连接、建表与上述两个函数，接入流水线。
+**公开函数**：
 
-**调用方**：阶段 1 无人调用。
+| 函数 | 说明 |
+|---|---|
+| `init_db(db_path)` | 初始化所有表 |
+| `create_document(db_path, title, raw_text, source_lang, target_lang)` | 创建文档，返回 document_id |
+| `save_paragraphs(db_path, document_id, paragraphs)` | 保存段落，返回 paragraph_id 列表 |
+| `create_translation_run(db_path, document_id, engine, ...)` | 创建运行记录，返回 run_id |
+| `save_paragraph_result(db_path, run_id, paragraph_id, ...)` | 增量保存某段某阶段结果 |
+| `save_paragraph_results(...)` | 批量保存 |
+| `update_run_status(...)` | 更新运行状态/错误/取舍说明/报告 |
+| `save_review_note(...)` | 保存全文或分段审校意见 |
+| `save_human_translation(...)` | 保存人工最终译文 |
+| `get_run(db_path, run_id)` | 查询单条运行 |
+| `list_runs(db_path)` | 历史运行列表 |
+| `get_run_details(db_path, run_id)` | 完整详情（文档、段落、结果、意见） |
+
+**数据库路径**：默认 `data/translations.db`，可用环境变量 `DATABASE_PATH` 覆盖。
+
+**教师审校记录（阶段 4.1）**：新增 `review_records` 表，按 `(run_id, unit_id, revision)` 唯一，保存 L0/L1/L2/L3 与 `verified`。相关函数：
+`create_review_record` / `save_l1_review` / `save_l2_review` / `save_l3_verified` / `get_review_record` / `get_latest_review_record` / `list_review_records`。
+
+**调用方**：app.py 流水线与历史记录区。
+
+---
+
+## app.py — Streamlit 页面（唯一 UI 入口）
 
 ---
 
@@ -185,12 +209,12 @@ api 模式缺密钥时自动回退占位（不抛错）；调用失败（网络/
 | 函数 | 输入 | 输出 | 说明 |
 |---|---|---|---|
 | `run_pipeline(text: str)` | 整篇阿语文本 | `dict`（13 键：paragraphs/translations/direct_translations/corrected_translations/final_translations/tradeoff_notes/term_hits/name_hits/report/translation_mode/translation_fallback/review_mode/review_fallback） | 完整入口（无 UI 回调），内部委托 `run_pipeline_progressive`；三个 LLM 列表分别为直接翻译/修正结果/最终结果；tradeoff_notes 为翻译取舍说明；translation_mode/review_mode 等为模式与回退标志 |
-| `run_pipeline_progressive(text, *, on_paragraphs=None, on_translation=None, on_review_start=None, on_review_done=None)` | 整篇阿语文本 + 可选回调 | `dict`（同上） | 渐进式流水线：切分完成回调、每段翻译完成回调、LLM 开始/完成回调；页面用它实现“等待翻译→翻译完成→LLM 审校中”的动态展示 |
+| `run_pipeline_progressive(text, *, on_paragraphs=None, on_translation=None, on_review_start=None, on_review_done=None, db_path=None)` | 整篇阿语文本 + 可选回调 | `dict`（同上） | 渐进式流水线：切分完成回调、每段翻译完成回调、LLM 开始/完成回调；并将每阶段结果增量保存到 SQLite |
 | `_load_sample()` | 无 | `str` | 读取 data/samples/politics_001.txt 预填输入框 |
 | `_hits_to_rows(hits, columns)` | 命中列表 + 要展示的列 | `list[dict]` 展示行 | 统一列序，供 st.dataframe 渲染 |
 | `render_results(results)` | run_pipeline 的结果 dict | 无（直接渲染页面） | 渲染「四结果对比/术语命中/专名命中/审校报告」；四结果固定展示：原始 API 译文、LLM 直接翻译、LLM 修正结果、LLM 最终结果 |
 
-**页面布局**：标题 → 阿语输入框（预填样例）→ 「开始翻译与审校」按钮 → 四结果对比（阿语 RTL 右对齐；固定展示原始 API 译文 / LLM 直接翻译 / LLM 修正结果 / LLM 最终结果）→ 翻译取舍说明 → 术语命中表（六列）→ 专名命中表（四列）→ 审校报告区。
+**页面布局**：标题 → 阿语输入框（预填样例）→ 「开始翻译与审校」按钮 → 四结果对比（阿语 RTL 右对齐；固定展示原始 API 译文 / LLM 直接翻译 / LLM 修正结果 / LLM 最终结果）→ 翻译取舍说明 → 术语命中表（六列）→ 专名命中表（四列）→ 审校报告区 → 历史记录区（查看历史运行、编辑人工译文、保存审校意见）。
 
 **关键实现**：
 - 顶部 `load_dotenv(BASE_DIR / ".env")` 加载本地密钥（全项目唯一 import dotenv 处）

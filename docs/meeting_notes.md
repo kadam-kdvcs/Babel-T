@@ -200,3 +200,31 @@
 
 - `python -m pytest -q`：**105 passed**
 - Playwright 真实 API/LLM 模式验证：页面显示四结果对比，每段四种译文标签齐全，无控制台错误
+
+## 2026-08-30 · 第 4 阶段确认：SQLite 持久化与历史记录
+
+### 一、需求确认
+
+团队不熟悉 SQLite，因此要求教学性、可读性、低复杂度。本阶段只做：
+
+1. SQLite 保存翻译审校任务；
+2. 查看历史任务；
+3. 人工修改最终译文；
+4. 保存老师/人工审校意见；
+5. 页面重启后仍可读取历史。
+
+### 二、设计决策
+
+| 决策点 | 结论 |
+|---|---|
+| 存储方式 | 标准库 `sqlite3`，不引入 ORM |
+| 数据库路径 | 默认 `data/translations.db`，可用 `DATABASE_PATH` 覆盖 |
+| 表结构 | documents / paragraphs / translation_runs / paragraph_results / review_notes |
+| 增量保存 | reviewer 拆成三个公开函数，流水线每步完成后立即保存 |
+| 失败保留 | 任一阶段失败更新 partial/failed，已保存结果不丢 |
+| 界面 | 不重写前端，在现有 Streamlit 底部增加历史记录、人工译文、审校意见 |
+| 测试 | 新增 `tests/test_storage.py`，原 105 条全部保留 |
+
+### 三、验证情况
+
+- 全量 `python -m pytest -q`：**118 passed**

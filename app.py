@@ -25,6 +25,7 @@ LLM 直接翻译结果、LLM 修正结果、LLM 最终结果（以原文为准�
 """
 
 import html  # 标准库：转义用户文本，防止 HTML 注入
+import json  # 标准库：读取/确认 L2/L3 JSON 内容
 from collections.abc import Callable  # 标准库：类型标注用（流水线回调）
 from pathlib import Path  # 标准库：跨平台路径处理
 
@@ -41,7 +42,7 @@ from dotenv import load_dotenv
 # 业务模块：段落切分 / 词库扫描 / 翻译（双模式）/ 占位报告；
 # settings 是翻译配置中心（环境变量名/默认值/配置加载），
 # 配置符号从这里取，翻译符号（translate_paragraphs、异常）从 translator 取
-from modules import glossary, reviewer, segmenter, settings, translator
+from modules import glossary, reviewer, segmenter, settings, storage, translator
 
 # 项目根目录：本文件所在目录（无论从哪个目录启动 streamlit 都有效）
 BASE_DIR = Path(__file__).parent
@@ -102,109 +103,192 @@ def run_pipeline_progressive(
     on_translation: Callable[[int, str], None] | None = None,
     on_review_start: Callable[[], None] | None = None,
     on_review_done: Callable[[dict], None] | None = None,
+    db_path: Path | None = None,
 ) -> dict:
-    """执行完整处理流水线，并支持“逐段完成即回调”。
+    """执行完整处理流水线，并支持“逐段完成即回调”与 SQLite 持久化。
 
-    作用：与 run_pipeline 一样返回完整结果，但额外暴露四个回调：
-          - on_paragraphs(paragraphs)：切分完成后调用（UI 可先创建占位符）；
-          - on_translation(index, translation)：某段 API 翻译完成立即调用
-            （0 基 index，主线程安全，可实时更新 st.empty）；
-          - on_review_start()：全部翻译完成后、开始 LLM 纠正/审校前调用；
-          - on_review_done(review_result)：LLM 返回后调用。
-          API 机器翻译在 translate_paragraphs_parallel 中并发执行；
-          LLM 纠正以整篇文章为输入，必须等全部段落翻译完成后才能开始。
-    输入：text —— 用户输入的整篇阿语文本；回调均可选。
-    输出：dict —— 键：
-          paragraphs           阿语段落列表
-          translations         原始 API 译文列表（占位或真实翻译）
-          direct_translations  LLM 直接翻译原文的结果列表
-          corrected_translations LLM 基于 API 译文修正后的结果列表
-          final_translations   LLM 结合原文/直接/修正后的最终仲裁结果列表
-          tradeoff_notes       LLM 对直接翻译与修正结果的取舍说明
-          term_hits            术语命中列表
-          name_hits            专名命中列表
-          report               审校报告字符串（占位或 LLM 生成）
-          translation_mode     "mock" 或 "api"（本次生效的翻译模式）
-          translation_fallback True 表示「api 模式但缺密钥，本次用了占位译文」
-          review_mode          "mock" 或 "api"（本次生效的审校模式）
-          review_fallback      True 表示「api 模式但缺密钥，本次用了占位报告」
-    异常：数据文件缺失时抛出 FileNotFoundError；翻译失败抛
-          translator.TranslationError 家族；审校失败抛 reviewer.ReviewError
-          家族；环境变量非法抛 ValueError（全部由 UI 层转成页面提示）。
+    作用：
+      - 同旧版一样返回完整结果；
+      - 在任务开始后创建 document / paragraphs / translation_run；
+      - API 每段完成后立即保存 api_translation；
+      - LLM 直接翻译、修正、最终仲裁每步完成后立即保存；
+      - 任一阶段失败时更新 run 状态并保留已保存结果。
+    输入：text —— 原文；回调均可选；db_path —— 可选的数据库路径。
+    输出：dict —— 与阶段 3.2 相同的结果结构。
     """
     # 段落切分：整篇文本 → 段落列表
     paragraphs = segmenter.segment_paragraphs(text)
     if on_paragraphs is not None:
         on_paragraphs(paragraphs)
 
-    # 加载术语库（六列 CSV）与专名库（四列 CSV），路径相对项目根目录
-    terms = glossary.load_glossary(BASE_DIR / "data" / "terms.csv")
-    names = glossary.load_glossary(BASE_DIR / "data" / "proper_names.csv")
+    # ---- 持久化：创建文档、段落、运行记录 ----
+    run_id = None
+    paragraph_ids: list[int] = []
+    saved_any = False
+    if paragraphs:
+        document_id = storage.create_document(
+            db_path,
+            title="翻译任务",
+            raw_text=text,
+            source_lang="ar",
+            target_lang="zh",
+        )
+        paragraph_ids = storage.save_paragraphs(db_path, document_id, paragraphs)
+        run_id = storage.create_translation_run(
+            db_path,
+            document_id,
+            translation_engine=settings.load_translation_config().engine,
+            review_engine=settings.load_review_config().engine,
+            translation_model=settings.load_translation_config().model if hasattr(settings.load_translation_config(), "model") else "",
+            review_model=settings.load_review_config().model,
+        )
+        # 现在 run_id 已知，初始化 pending 记录
+        for pid in paragraph_ids:
+            storage.save_paragraph_result(
+                db_path, run_id, pid, status="pending"
+            )
 
-    # 在段落中扫描命中（两库共用同一个扫描函数）
-    term_hits = glossary.scan_glossary(paragraphs, terms)
-    name_hits = glossary.scan_glossary(paragraphs, names)
+    # 包装 on_translation：每段 API 翻译完成后保存
+    def _persist_translation(index: int, translation: str) -> None:
+        nonlocal saved_any
+        saved_any = True
+        if on_translation is not None:
+            on_translation(index, translation)
+        if run_id is not None:
+            storage.save_paragraph_result(
+                db_path,
+                run_id,
+                paragraph_ids[index],
+                api_translation=translation,
+                status="completed",
+            )
 
-    # 翻译：mock 模式生成占位译文，api 模式并发调用阿里云真实翻译；
-    # on_translation 让 Streamlit 在主线程实时更新已完成的段落。
-    translations = translator.translate_paragraphs_parallel(
-        paragraphs,
-        term_hits,
-        name_hits,
-        on_translation=on_translation,
-    )
+    try:
+        # 加载术语库与专名库
+        terms = glossary.load_glossary(BASE_DIR / "data" / "terms.csv")
+        names = glossary.load_glossary(BASE_DIR / "data" / "proper_names.csv")
+        term_hits = glossary.scan_glossary(paragraphs, terms)
+        name_hits = glossary.scan_glossary(paragraphs, names)
 
-    # 读取本次生效的翻译配置，确定「模式」与「是否回退占位」两个展示键。
-    # 页面直接读这两个键渲染提示，不在 UI 层重复推断配置逻辑；
-    # 环境变量非法时这里（以及 translate_paragraphs_parallel 内部）会抛 ValueError。
-    config = settings.load_translation_config()
-    translation_mode = config.engine
-    translation_fallback = (
-        config.engine == settings.API_ENGINE and not config.has_credentials
-    )
+        # 翻译：mock 占位 / api 并发翻译
+        translations = translator.translate_paragraphs_parallel(
+            paragraphs,
+            term_hits,
+            name_hits,
+            on_translation=_persist_translation,
+        )
 
-    # LLM 步骤开始前通知 UI（可更新“正在 LLM 纠正/审校”状态）
-    if on_review_start is not None:
-        on_review_start()
+        # 翻译模式与回退标志
+        config = settings.load_translation_config()
+        translation_mode = config.engine
+        translation_fallback = (
+            config.engine == settings.API_ENGINE and not config.has_credentials
+        )
 
-    # 审校结果包（阶段 3.2：三次独立调用拿到「直接翻译 / 修正结果 / 最终结果 /
-    # 取舍说明 / 审校报告」；mock 或缺密钥时均为占位数据，由页面黄色提示告知用户）
-    review_result = reviewer.generate_review_bundle(
-        paragraphs, translations, term_hits, name_hits
-    )
-    if on_review_done is not None:
-        on_review_done(review_result)
+        # mock/回退模式不会触发 on_translation，这里补一次保存，保证历史里有 API 译文
+        if run_id is not None and (translation_mode == settings.MOCK_ENGINE or translation_fallback):
+            for idx, trans in enumerate(translations):
+                storage.save_paragraph_result(
+                    db_path,
+                    run_id,
+                    paragraph_ids[idx],
+                    api_translation=trans,
+                    status="completed",
+                )
 
-    report = review_result["report"]
-    direct_translations = review_result["direct_translations"]
-    corrected_translations = review_result["corrected_translations"]
-    final_translations = review_result["final_translations"]
-    tradeoff_notes = review_result.get("tradeoff_notes", "")
+        # LLM 多轮处理前通知 UI
+        if on_review_start is not None:
+            on_review_start()
 
-    # 读取本次生效的审校配置，确定「模式」与「是否回退占位」两个展示键
-    # （与上方翻译配置块对称：页面直接读这两个键渲染提示，不在 UI 层
-    # 重复推断配置逻辑；环境变量非法时这里会抛 ValueError）
-    review_config = settings.load_review_config()
-    review_mode = review_config.engine
-    review_fallback = (
-        review_config.engine == settings.API_ENGINE and not review_config.has_credentials
-    )
+        # 第一步：LLM 直接翻译
+        direct_result = reviewer.generate_direct_translations(
+            paragraphs, term_hits, name_hits, fallback_translations=translations
+        )
+        if run_id is not None:
+            for pid, trans in zip(paragraph_ids, direct_result["translations"]):
+                storage.save_paragraph_result(
+                    db_path, run_id, pid, llm_direct_translation=trans
+                )
 
-    return {
-        "paragraphs": paragraphs,
-        "translations": translations,
-        "direct_translations": direct_translations,
-        "corrected_translations": corrected_translations,
-        "final_translations": final_translations,
-        "tradeoff_notes": tradeoff_notes,
-        "term_hits": term_hits,
-        "name_hits": name_hits,
-        "report": report,
-        "translation_mode": translation_mode,
-        "translation_fallback": translation_fallback,
-        "review_mode": review_mode,
-        "review_fallback": review_fallback,
-    }
+        # 第二步：基于 API 译文修正
+        corrected_result = reviewer.generate_corrected_translations(
+            paragraphs, translations, term_hits, name_hits
+        )
+        if run_id is not None:
+            for pid, trans in zip(paragraph_ids, corrected_result["translations"]):
+                storage.save_paragraph_result(
+                    db_path, run_id, pid, llm_corrected_translation=trans
+                )
+
+        # 第三步：最终仲裁
+        final_result = reviewer.generate_final_arbitration(
+            paragraphs,
+            direct_result["translations"],
+            corrected_result["translations"],
+            term_hits,
+            name_hits,
+        )
+        if run_id is not None:
+            for pid, trans in zip(paragraph_ids, final_result["final_translations"]):
+                storage.save_paragraph_result(
+                    db_path, run_id, pid, llm_final_translation=trans
+                )
+            storage.update_run_status(
+                db_path,
+                run_id,
+                "completed",
+                tradeoff_notes=final_result.get("tradeoff_notes", ""),
+                report=final_result.get("report", ""),
+                completed=True,
+            )
+
+        # 完整结果包
+        review_result = {
+            "report": final_result.get("report", ""),
+            "direct_translations": direct_result["translations"],
+            "corrected_translations": corrected_result["translations"],
+            "final_translations": final_result.get("final_translations", []),
+            "tradeoff_notes": final_result.get("tradeoff_notes", ""),
+            "direct_degraded": direct_result.get("degraded", False),
+            "corrected_degraded": corrected_result.get("degraded", False),
+            "final_degraded": final_result.get("final_degraded", False),
+            "tradeoff_degraded": final_result.get("tradeoff_degraded", False),
+        }
+        if on_review_done is not None:
+            on_review_done(review_result)
+        return {
+            "paragraphs": paragraphs,
+            "translations": translations,
+            "direct_translations": review_result["direct_translations"],
+            "corrected_translations": review_result["corrected_translations"],
+            "final_translations": review_result["final_translations"],
+            "tradeoff_notes": review_result["tradeoff_notes"],
+            "direct_degraded": review_result["direct_degraded"],
+            "corrected_degraded": review_result["corrected_degraded"],
+            "final_degraded": review_result["final_degraded"],
+            "tradeoff_degraded": review_result["tradeoff_degraded"],
+            "term_hits": term_hits,
+            "name_hits": name_hits,
+            "report": review_result["report"],
+            "translation_mode": translation_mode,
+            "translation_fallback": translation_fallback,
+            "review_mode": settings.load_review_config().engine,
+            "review_fallback": (
+                settings.load_review_config().engine == settings.API_ENGINE
+                and not settings.load_review_config().has_credentials
+            ),
+        }
+    except Exception as e:
+        # 任一阶段失败：保留已保存结果，更新运行状态为 partial/failed 后继续抛出
+        if run_id is not None:
+            status = "partial" if saved_any else "failed"
+            try:
+                storage.update_run_status(
+                    db_path, run_id, status, error_message=str(e)
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        raise
 
 
 def _hits_to_rows(hits: list[dict], columns: list[str]) -> list[dict]:
@@ -365,6 +449,274 @@ def render_results(results: dict) -> None:
         # mock 模式或回退占位：报告是纯占位文本，用 st.info 灰底信息框展示
         st.info(results["report"])
 
+
+
+def render_history() -> None:
+    """渲染历史记录区：选择运行、查看详情、保存人工译文与审校意见。"""
+    st.subheader("历史记录")
+    try:
+        runs = storage.list_runs(None)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"读取历史记录失败：{e}")
+        return
+    if not runs:
+        st.caption("暂无历史记录。")
+        return
+
+    options = {r["id"]: f"#{r['id']} —— {r['status']} —— {r['started_at']}" for r in runs}
+    selected_id = st.selectbox("选择历史运行", list(options.keys()), format_func=lambda x: options[x])
+    details = storage.get_run_details(None, selected_id)
+    if details is None:
+        st.warning("找不到该运行记录。")
+        return
+
+    st.markdown(f"**状态：** {details['run']['status']}")
+    if details["run"].get("error_message"):
+        st.warning(f"错误信息：{details['run']['error_message']}")
+    if details["run"].get("tradeoff_notes"):
+        st.markdown("**翻译取舍说明：**")
+        st.markdown(details["run"]["tradeoff_notes"])
+    if details["run"].get("report"):
+        st.markdown("**审校报告：**")
+        st.markdown(details["run"]["report"])
+
+    # ---- 段落详情与人工译文 ----
+    st.markdown("### 段落结果与人工最终译文")
+    for p in details["paragraphs"]:
+        st.markdown(f"**第 {p['paragraph_index'] + 1} 段（阿语）**")
+        st.write(p["source_text"])
+        st.caption(
+            f"API：{p.get('api_translation') or '无'} ｜ "
+            f"直接：{p.get('llm_direct_translation') or '无'} ｜ "
+            f"修正：{p.get('llm_corrected_translation') or '无'} ｜ "
+            f"最终：{p.get('llm_final_translation') or '无'} ｜ "
+            f"人工：{p.get('human_final_translation') or '无'}"
+        )
+        current_value = p.get("human_final_translation") or p.get("llm_final_translation") or ""
+        human_text = st.text_area(
+            f"人工译文（第 {p['paragraph_index'] + 1} 段）",
+            value=current_value,
+            key=f"human_{selected_id}_{p['paragraph_id']}",
+        )
+        if st.button("保存人工译文", key=f"save_human_{selected_id}_{p['paragraph_id']}"):
+            storage.save_human_translation(None, selected_id, p["paragraph_id"], human_text)
+            st.success("已保存人工译文。")
+
+        # 分段审校意见
+        para_note_content = st.text_area(
+            f"分段审校意见（第 {p['paragraph_index'] + 1} 段）",
+            key=f"para_note_{selected_id}_{p['paragraph_id']}",
+        )
+        if st.button("保存分段审校意见", key=f"save_para_note_{selected_id}_{p['paragraph_id']}"):
+            if para_note_content.strip():
+                storage.save_review_note(
+                    None,
+                    selected_id,
+                    para_note_content,
+                    note_type="other",
+                    paragraph_id=p["paragraph_id"],
+                )
+                st.success("已保存分段审校意见。")
+            else:
+                st.warning("分段意见内容不能为空。")
+
+        # ---- 教师审校工作流（L1 → L2 → L3）----
+        st.markdown(f"#### 教师审校：第 {p['paragraph_index'] + 1} 段")
+        draft_translation = p.get("llm_final_translation") or p.get("human_final_translation") or ""
+        latest_record = storage.get_latest_review_record(
+            None, selected_id, p["paragraph_id"]
+        )
+        if latest_record is None:
+            # L1 提交表单
+            teacher_decision_label = st.radio(
+                "审校结论",
+                ["pass", "revise", "retranslate"],
+                format_func=lambda x: {"pass": "通过", "revise": "修改", "retranslate": "重译"}[x],
+                key=f"decision_{selected_id}_{p['paragraph_id']}",
+            )
+            teacher_error_types = st.multiselect(
+                "问题类型（可多选）",
+                ["semantic_mistranslation", "omission", "addition", "grammar",
+                 "reference", "proper_name_or_term", "style", "chinese_expression",
+                 "cultural_context", "footnote_or_note", "punctuation_or_format", "other"],
+                format_func=lambda x: {
+                    "semantic_mistranslation": "语义误译", "omission": "漏译",
+                    "addition": "增译", "grammar": "语法理解", "reference": "指代关系",
+                    "proper_name_or_term": "专名/术语", "style": "语体风格",
+                    "chinese_expression": "中文表达", "cultural_context": "文化背景",
+                    "footnote_or_note": "脚注/译者注", "punctuation_or_format": "标点/格式",
+                    "other": "其他",
+                }[x],
+                key=f"errors_{selected_id}_{p['paragraph_id']}",
+            )
+            teacher_custom_error_types = ""
+            if "other" in teacher_error_types:
+                teacher_custom_error_types = st.text_input(
+                    "其他问题归类（请填写你希望归类的审校类型）",
+                    key=f"other_error_{selected_id}_{p['paragraph_id']}",
+                )
+            teacher_severity = st.radio(
+                "严重程度",
+                ["minor", "moderate", "major", "null"],
+                format_func=lambda x: {
+                    "minor": "轻微", "moderate": "一般", "major": "严重", "null": "无问题",
+                }[x],
+                key=f"severity_{selected_id}_{p['paragraph_id']}",
+            )
+            teacher_revision = st.text_area(
+                "教师修改译文",
+                value=draft_translation,
+                key=f"teacher_revision_{selected_id}_{p['paragraph_id']}",
+            )
+            teacher_raw_comment = st.text_area(
+                "教师原始说明（可选）",
+                key=f"teacher_comment_{selected_id}_{p['paragraph_id']}",
+            )
+            if st.button(
+                "提交教师审校",
+                key=f"submit_l1_{selected_id}_{p['paragraph_id']}",
+            ):
+                record_id = storage.create_review_record(
+                    None,
+                    selected_id,
+                    p["paragraph_id"],
+                    p["source_text"],
+                    draft_translation,
+                )
+                storage.save_l1_review(
+                    None,
+                    record_id,
+                    teacher_decision=teacher_decision_label,
+                    teacher_error_types=teacher_error_types,
+                    teacher_custom_error_types=teacher_custom_error_types,
+                    teacher_severity=teacher_severity,
+                    teacher_revision=teacher_revision,
+                    teacher_raw_comment=teacher_raw_comment,
+                )
+                try:
+                    std = reviewer.generate_standardized_review(
+                        p["source_text"],
+                        draft_translation,
+                        teacher_decision_label,
+                        teacher_error_types,
+                        teacher_severity,
+                        teacher_revision,
+                        teacher_raw_comment,
+                    )
+                    storage.save_l2_review(
+                        None,
+                        record_id,
+                        llm_raw_normalized_response=std["raw"],
+                        normalized_review=std["normalized"],
+                        llm_model=std["model"],
+                        prompt_version=std["prompt_version"],
+                        normalized_status=std["status"],
+                    )
+                except Exception as e:  # noqa: BLE001
+                    # L1 已保存，LLM 失败不丢失教师数据
+                    st.warning(f"AI 标准化生成失败，已保留教师 L1：{e}")
+                st.success("教师审校已提交。")
+                st.rerun()
+        else:
+            # 已有审校记录，展示 L1/L2/L3 状态
+            st.caption(
+                f"L1：{latest_record.get('teacher_decision') or '未提交'} ｜ "
+                f"L2：{latest_record.get('normalized_status') or '未生成'} ｜ "
+                f"verified：{'是' if latest_record.get('verified') else '否'}"
+            )
+            if latest_record.get("teacher_raw_comment"):
+                st.markdown(f"**教师原始说明：** {latest_record['teacher_raw_comment']}")
+            if latest_record.get("teacher_custom_error_types"):
+                st.markdown(
+                    f"**其他问题归类：** {latest_record['teacher_custom_error_types']}"
+                )
+            normalized = latest_record.get("normalized_review") or {}
+            if normalized:
+                st.markdown("**AI 整理后的审校意见：**")
+                st.write(normalized)
+                if not latest_record.get("verified"):
+                    # 教师确认或修改后确认 L3
+                    confirm_revision = st.text_area(
+                        "确认后的审校内容（可修改）",
+                        value=json.dumps(normalized, ensure_ascii=False, indent=2),
+                        key=f"confirm_l2_{selected_id}_{p['paragraph_id']}",
+                    )
+                    if normalized.get("has_conflict"):
+                        st.warning(
+                            "检测到结构化字段与教师说明冲突，请先解决冲突后再确认。"
+                            f"冲突字段：{normalized.get('conflict_fields')}"
+                        )
+                    elif st.button(
+                        "确认（生成 L3）",
+                        key=f"confirm_l3_{selected_id}_{p['paragraph_id']}",
+                    ):
+                        try:
+                            confirmed = json.loads(confirm_revision)
+                        except Exception:  # noqa: BLE001
+                            confirmed = dict(normalized)
+                            confirmed["normalized_comment"] = confirm_revision
+                        storage.save_l3_verified(
+                            None,
+                            latest_record["id"],
+                            verified_review=confirmed,
+                            reviewer_id="teacher",
+                        )
+                        st.success("已确认，进入高质量审校库。")
+                        st.rerun()
+            else:
+                # AI 标准化失败，保留 L1，可由教师手动确认 L1 作为 L2
+                if st.button("手动确认 L1 作为 L2", key=f"manual_l2_{selected_id}_{p['paragraph_id']}"):
+                    storage.save_l2_review(
+                        None,
+                        latest_record["id"],
+                        llm_raw_normalized_response="（手动）",
+                        normalized_review={
+                            "decision": latest_record.get("teacher_decision"),
+                            "error_types": latest_record.get("teacher_error_types") or [],
+                            "severity": latest_record.get("teacher_severity"),
+                            "teacher_revision": latest_record.get("teacher_revision") or "",
+                            "teacher_raw_comment": latest_record.get("teacher_raw_comment") or "",
+                            "has_conflict": False,
+                            "conflict_fields": [],
+                            "conflict_explanation": "",
+                        },
+                        llm_model="manual",
+                        prompt_version="manual",
+                        normalized_status="manual",
+                    )
+                    st.rerun()
+
+
+    # ---- 全文审校意见 ----
+    st.markdown("### 保存全文审校意见")
+    note_type = st.selectbox(
+        "意见类型",
+        ["translation_error", "terminology", "fact_check", "style", "approved", "other"],
+        key=f"note_type_{selected_id}",
+    )
+    author = st.text_input("署名（可选）", key=f"author_{selected_id}")
+    note_content = st.text_area("意见内容", key=f"note_content_{selected_id}")
+    if st.button("保存全文审校意见", key=f"save_note_{selected_id}"):
+        if not note_content.strip():
+            st.warning("意见内容不能为空。")
+        else:
+            storage.save_review_note(None, selected_id, note_content, note_type=note_type, author=author)
+            st.success("已保存全文审校意见。")
+
+    # ---- 已保存意见 ----
+    if details["notes"]:
+        st.markdown("### 已保存的审校意见")
+        para_index_map = {p["paragraph_id"]: p["paragraph_index"] for p in details["paragraphs"]}
+        for n in details["notes"]:
+            if n["paragraph_id"] is not None:
+                # 找到对应段落号，在内容前面明确标注是哪一段的意见
+                para_no = para_index_map.get(n["paragraph_id"], -1)
+                location = f"第 {para_no + 1} 段" if para_no >= 0 else "未知段落"
+            else:
+                location = "全文"
+            st.write(
+                f"**[{location}][{n['note_type']}]** {n['content']} —— {n['author'] or '未署名'}"
+            )
 
 # ---------- 页面主体（脚本每次交互都会整体重跑） ----------
 
@@ -528,3 +880,6 @@ st.caption("最终结果对比：四个结果同时展示；最终结果以原�
 # 有结果时渲染展示区（每次重跑都会重新渲染，保证结果不消失）
 if "results" in st.session_state:
     render_results(st.session_state["results"])
+
+# 历史记录区（页面重启后仍可读取）
+render_history()
