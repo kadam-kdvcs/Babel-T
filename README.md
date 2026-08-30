@@ -42,6 +42,8 @@
 ```
 arabic-review-mvp/
 ├── app.py                      # Streamlit 页面（唯一 UI 入口）
+├── pipeline.py                 # 核心流水线（切分→扫描→翻译→LLM 多结果）
+├── streamlit_ui.py             # Streamlit 结果渲染
 ├── requirements.txt            # streamlit / pytest / requests / python-dotenv
 ├── .env.example                # 环境变量模板（Key 留空，供复制为 .env）
 ├── .env                        # 本地真实密钥（gitignored，绝不提交）
@@ -54,10 +56,13 @@ arabic-review-mvp/
 │   ├── segmenter.py            # 段落切分
 │   ├── glossary.py             # 归一化 / CSV 加载 / 命中扫描
 │   ├── translator.py           # 翻译双模式：mock 占位 / api 阿里云真实翻译
-│   ├── reviewer.py             # 审校双模式：mock 占位 / api LLM 审校报告
+│   ├── reviewer.py             # LLM 编排：直接翻译/修正/最终仲裁/报告
+│   ├── reviewer_parsing.py     # LLM 返回解析与降级标志
 │   └── storage.py              # 占位（阶段 4 接 SQLite）
 ├── prompts/
-│   └── review_report_prompt.md # LLM 审校提示词模板（阶段 3 已启用：8 项报告结构）
+│   ├── direct_translation_prompt.md   # 直接翻译提示词
+│   ├── correct_translation_prompt.md  # 修正提示词
+│   └── review_report_prompt.md        # 最终仲裁+取舍说明+审校报告提示词
 ├── docs/
 │   ├── meeting_notes.md        # 开发决策记录
 │   ├── modules.md              # 模块功能说明（供审查）

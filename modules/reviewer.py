@@ -73,16 +73,17 @@ _PLACEHOLDERS = ("source_paragraphs", "direct_translations", "corrected_translat
 _USER_SECTION_MARKER = "## 用户消息"
 _SYSTEM_SECTION_MARKER = "## 系统消息"
 
-# LLM 返回内容的结构标记：
-# - 直接翻译响应：`## 直接翻译结果`
-# - 修正响应：`## API译文修正结果`
-# - 最终仲裁响应：`## 最终结果` + `## 翻译取舍说明` + `## 审校报告`
-# 若模型没有按这些标题输出，程序会安全回退。
-_DIRECT_SECTION_MARKER = "## 直接翻译结果"
-_CORRECTED_SECTION_MARKER = "## API译文修正结果"
-_FINAL_SECTION_MARKER = "## 最终结果"
-_TRADEOFF_SECTION_MARKER = "## 翻译取舍说明"
-_REPORT_SECTION_MARKER = "## 审校报告"
+# LLM 返回内容的结构标记已移至 modules/reviewer_parsing.py
+from modules.reviewer_parsing import (
+    _DIRECT_SECTION_MARKER,
+    _CORRECTED_SECTION_MARKER,
+    _FINAL_SECTION_MARKER,
+    _TRADEOFF_SECTION_MARKER,
+    _REPORT_SECTION_MARKER,
+    _parse_numbered_translations,
+    _parse_numbered_translations_with_status,
+    _parse_review_bundle,
+)
 
 # LLM 采样温度：固定 0.3（偏低温，审校任务希望输出稳定、少发散；
 # 阶段 3 决策：不配环境变量）
@@ -208,7 +209,7 @@ def generate_review_bundle(
             "name_hits": hits_text,
         },
     )
-    direct_translations = _parse_numbered_translations(
+    direct_translations, direct_degraded = _parse_numbered_translations_with_status(
         direct_content, paragraphs, translations
     )
 
@@ -224,7 +225,7 @@ def generate_review_bundle(
             "name_hits": hits_text,
         },
     )
-    corrected_translations = _parse_numbered_translations(
+    corrected_translations, corrected_degraded = _parse_numbered_translations_with_status(
         corrected_content, paragraphs, translations
     )
 
@@ -243,7 +244,9 @@ def generate_review_bundle(
     )
     bundle = _parse_review_bundle(final_content, paragraphs, corrected_translations)
     bundle["direct_translations"] = direct_translations
+    bundle["direct_degraded"] = direct_degraded
     bundle["corrected_translations"] = corrected_translations
+    bundle["corrected_degraded"] = corrected_degraded
     return bundle
 
 
@@ -277,104 +280,11 @@ def _generate_mock_bundle(
             for i in range(len(paragraphs))
         ],
         "tradeoff_notes": "（占位）翻译取舍说明：待接入 LLM 最终仲裁后生成。",
+        "direct_degraded": False,
+        "corrected_degraded": False,
+        "final_degraded": False,
+        "tradeoff_degraded": False,
     }
-
-
-def _parse_review_bundle(
-    content: str, paragraphs: list[str], corrected_translations: list[str]
-) -> dict:
-    """把“最终仲裁”回复拆成 最终结果 / 翻译取舍说明 / 审校报告。
-
-    作用：这就是最终仲裁那一次 LLM 调用的解析函数。它只负责解析：
-          - `## 最终结果`：最终译文列表；
-          - `## 翻译取舍说明`：模型对不同翻译版本取舍和原因；
-          - `## 审校报告`：8 项报告。
-          直接翻译和修正结果已经在各自独立调用中解析完成，所以这里不再
-          解析它们，避免职责混杂。
-    输入：content —— 最终仲裁 LLM 回复全文；
-          paragraphs —— 阿语段落列表；
-          corrected_translations —— 修正结果（最终结果解析失败时兜底）。
-    输出：dict —— 含 report / final_translations / tradeoff_notes。
-    """
-    def _section_text(start_marker: str, end_marker: str) -> str | None:
-        """取 start_marker 到 end_marker 之间的文本；缺少标记返回 None。"""
-        if start_marker not in content or (end_marker and end_marker not in content):
-            return None
-        part = content.split(start_marker, 1)[1]
-        if end_marker:
-            part = part.split(end_marker, 1)[0]
-        return part
-
-    # 完全没有最终仲裁结构标记时，整体回退为“旧版单段报告”
-    has_any_section = any(
-        marker in content
-        for marker in (_FINAL_SECTION_MARKER, _TRADEOFF_SECTION_MARKER, _REPORT_SECTION_MARKER)
-    )
-    if not has_any_section:
-        return {
-            "report": content.strip(),
-            "final_translations": list(corrected_translations),
-            "tradeoff_notes": "（缺省）模型未输出翻译取舍说明，请人工复核直接翻译与修正结果。",
-        }
-
-    # 最终结果：在“## 最终结果”到“## 翻译取舍说明”/“## 审校报告”之间
-    final_text = _section_text(_FINAL_SECTION_MARKER, _TRADEOFF_SECTION_MARKER)
-    if final_text is None:
-        final_text = _section_text(_FINAL_SECTION_MARKER, _REPORT_SECTION_MARKER)
-    final_translations = (
-        _parse_numbered_translations(final_text, paragraphs, corrected_translations)
-        if final_text is not None
-        else list(corrected_translations)
-    )
-
-    # 翻译取舍说明：在“## 翻译取舍说明”到“## 审校报告”之间
-    tradeoff_text = _section_text(_TRADEOFF_SECTION_MARKER, _REPORT_SECTION_MARKER)
-    if tradeoff_text is not None:
-        tradeoff_notes = tradeoff_text.strip()
-    else:
-        tradeoff_notes = "（缺省）模型未输出翻译取舍说明，请人工复核直接翻译与修正结果。"
-
-    # 审校报告：取“## 审校报告”之后全部内容
-    if _REPORT_SECTION_MARKER in content:
-        report = content.split(_REPORT_SECTION_MARKER, 1)[1].strip()
-    else:
-        report = content.strip()
-
-    return {
-        "report": report,
-        "final_translations": final_translations,
-        "tradeoff_notes": tradeoff_notes,
-    }
-
-
-def _parse_numbered_translations(
-    text: str, paragraphs: list[str], translations: list[str]
-) -> list[str]:
-    """从「第N段：…」文本中解析出译文列表。
-
-    作用：LLM 输出的每一轮结果通常按「第1段：...」逐行列出。这里用正则
-          提取每个「第N段：」到下一个段号/标题之间的内容；若提取到的
-          条数与段落数不一致，则说明模型格式不规范，回退使用兜底译文。
-    输入：text —— 某段结果内的 markdown 文本；
-          paragraphs —— 阿语段落列表（用于校验数量）；
-          translations —— 兜底译文列表（数量不符时使用）。
-    输出：list[str] —— 与 paragraphs 等长的译文列表。
-    """
-    # (?s) 让 . 匹配换行；(.*?) 非贪婪；(?=...) 下一条段号或二级标题处截断
-    pattern = re.compile(
-        r"第(\d+)段[:：](.*?)(?=\n\s*第\d+段[:：]|\n\s*## |\Z)", re.S
-    )
-    matches = pattern.findall(text)
-    # 解析出的条数必须与原段落数一致才算可信；否则旧数据兜底
-    if len(matches) != len(paragraphs):
-        return list(translations)
-
-    result = []
-    for number_str, segment in matches:
-        # 去掉行内常见的 markdown 加粗/斜体标记，保留正文
-        clean = re.sub(r"[*_#>`]", "", segment).strip()
-        result.append(clean)
-    return result
 
 
 def _generate_mock_report(

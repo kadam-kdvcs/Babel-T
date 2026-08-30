@@ -178,6 +178,20 @@ api 模式缺密钥时自动回退占位（不抛错）；调用失败（网络/
 
 ---
 
+## pipeline.py — 核心流水线（与 UI 解耦）
+
+**作用**：从 app.py 拆分出的流水线编排，包含 `run_pipeline` 与 `run_pipeline_progressive`；
+负责切分、词库扫描、并发翻译、LLM 多轮结果包组装；不包含任何 `st.*` UI 代码。
+
+---
+
+## streamlit_ui.py — Streamlit 结果渲染
+
+**作用**：从 app.py 拆分出的展示层，包含 `render_results`、`_hits_to_rows`、`load_sample`；
+负责四结果对比、翻译取舍说明、术语/专名命中表、审校报告渲染。
+
+---
+
 ## app.py — Streamlit 页面（唯一 UI 入口）
 
 **作用**：页面布局与交互；调用各模块组成流水线；展示结果。

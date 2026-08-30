@@ -238,8 +238,10 @@
 | prompts/review_report_prompt.md | 全文 | 最终仲裁：输出 `## 最终结果` / `## 翻译取舍说明` / `## 审校报告`；用户消息无 API 译文 |
 | app.py | :177-208、:240-345 | 返回结构新增 `tradeoff_notes`（13 键）；`render_results` 增加“翻译取舍说明”展示区 |
 | app.py | :500-520 | LLM 阶段提示改为“正在请求 LLM 多轮处理（直接翻译/修正/最终仲裁/审校）…” |
+| modules/reviewer.py / modules/reviewer_parsing.py | 全部 | 新增降级标志：`direct_degraded` / `corrected_degraded` / `final_degraded` / `tradeoff_degraded`；解析失败回退时页面明确标注“已降级到 API 译文/修正结果”，避免把 API 译文伪装成 LLM 成功结果 |
+| pipeline.py / streamlit_ui.py | 新增 | 把 app.py 的流水线编排拆到 pipeline.py，把结果渲染拆到 streamlit_ui.py，降低 app.py 体积 |
 | tests/test_reviewer.py | :102-180、:422-475、:890-970 | `_write_template` 改为写三份模板；api 成功/占位符/请求头测试改为 3 次调用；四结果测试改为三段独立响应 |
-| README.md / CLAUDE.md / docs/modules.md | 当前阶段/设计约定/模块说明 | 同步为阶段 3.2 三次独立调用 + 翻译取舍说明 |
+| README.md / CLAUDE.md / docs/modules.md | 当前阶段/设计约定/模块说明 | 同步为阶段 3.2 三次独立调用 + 翻译取舍说明 + 降级标注 + 拆分说明 |
 
 ### 阶段 3.2 验证
 
