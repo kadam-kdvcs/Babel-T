@@ -1,0 +1,27 @@
+# 域名审核完成、申请证书前使用的 Nginx 反向代理示例。
+# 将 babel-t.example.com 替换为实际的 Babel-T 子域名后，
+# 再放到 /etc/nginx/sites-available/ 并建立软链接。
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name babel-t.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8501;
+        proxy_http_version 1.1;
+
+        # Streamlit 的页面交互依赖 WebSocket；这两个请求头不能省略。
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 翻译和审校可能耗时较长，但仍需给请求设上限。
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+}

@@ -26,7 +26,10 @@ LLM 直接翻译结果、LLM 修正结果、LLM 最终结果（以原文为准�
 
 import html  # 标准库：转义用户文本，防止 HTML 注入
 from collections.abc import Callable  # 标准库：类型标注用（流水线回调）
+from collections import deque  # 标准库：保存最近请求时间，用于公开演示限流
 from pathlib import Path  # 标准库：跨平台路径处理
+from threading import Lock  # 标准库：保护多用户同时点击时的限流状态
+import time  # 标准库：使用单调时钟计算请求间隔
 
 import streamlit as st  # 页面框架：所有界面控件都来自这里
 
@@ -68,6 +71,31 @@ NAME_COLUMNS = ["阿语原文", "中文译文", "类别", "备注", "段落", "�
 # LLM 基于 API 译文修正 / LLM 最终仲裁结果。保留常量位供未来如需
 # 切换视图时使用。
 VIEW_COMPARISON = "四结果对比"
+
+# 公开部署时，输入越长、点击越频繁，API 费用和服务器负载越高。
+# 这里做应用层的保守保护：每个 Streamlit 进程最多处理 5 次/分钟，
+# 单次输入最多 20,000 个字符。正式域名阶段还会在 Nginx 层增加限流。
+MAX_INPUT_CHARS = 20_000
+MAX_REQUESTS_PER_MINUTE = 5
+_REQUEST_TIMES = deque()
+_REQUEST_LOCK = Lock()
+
+
+def _allow_public_request() -> bool:
+    """判断当前进程是否仍在公开演示请求额度内。
+
+    作用：限制短时间内的重复提交，降低真实 API 被误刷的风险。
+    输入：无。
+    输出：bool——允许本次请求时为 True，否则为 False。
+    """
+    now = time.monotonic()
+    with _REQUEST_LOCK:
+        while _REQUEST_TIMES and now - _REQUEST_TIMES[0] >= 60:
+            _REQUEST_TIMES.popleft()
+        if len(_REQUEST_TIMES) >= MAX_REQUESTS_PER_MINUTE:
+            return False
+        _REQUEST_TIMES.append(now)
+        return True
 
 
 def _load_sample() -> str:
@@ -431,6 +459,13 @@ source = st.text_area(
 if st.button("开始翻译与审校", type="primary"):
     if not source.strip():  # str.strip：判断是否只输入了空白字符
         st.warning("请输入阿拉伯语文本。")
+    elif len(source) > MAX_INPUT_CHARS:
+        st.warning(
+            f"输入内容过长（当前 {len(source):,} 个字符），请控制在 "
+            f"{MAX_INPUT_CHARS:,} 个字符以内。"
+        )
+    elif not _allow_public_request():
+        st.warning("公开演示请求较为频繁，请等待约 1 分钟后再试。")
     else:
         # 动态占位容器：翻译过程中实时更新“原文 + 等待/已翻译”。
         # Streamlit 的 st.empty 可以在脚本执行期间被主线程反复替换内容。

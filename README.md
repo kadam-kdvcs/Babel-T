@@ -100,6 +100,12 @@ streamlit run app.py
 python -m pytest -v
 ```
 
+## ECS 部署
+
+Babel-T 是独立的 Python + Streamlit 应用，不与个人博客共用网站目录。阿里云 ECS 部署、systemd 服务、GitHub Actions 和域名反向代理说明见 [`docs/ecs-deploy.md`](docs/ecs-deploy.md)。
+
+临时公网访问使用 `http://公网IPv4:8501`；域名审核完成后，再由 Nginx 转发到 `127.0.0.1:8501`。
+
 ## 数据文件格式
 
 两个 CSV 均为 **UTF-8（带 BOM，utf-8-sig）** 编码，Excel 可直接打开；表头不可修改（代码以表头名作为字段名）。**备注列约定不写逗号**（避免引号转义混乱）。

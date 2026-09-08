@@ -1,0 +1,134 @@
+name: Deploy Babel-T to ECS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: babel-t-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Prepare SSH
+        shell: bash
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SERVER_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$SERVER_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+
+      - name: Validate deployment inputs
+        shell: bash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_USER"
+          test "$DEPLOY_PATH" = "/opt/babel-t"
+          test -f app.py
+          test -f requirements.txt
+          test -d modules
+          test -d data
+          test -d prompts
+
+      - name: Test SSH connection
+        shell: bash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            -p "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "id && test -d '$DEPLOY_PATH/releases' && test -w '$DEPLOY_PATH/releases'"
+
+      - name: Upload release
+        shell: bash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          RELEASE_ID: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          release_path="$DEPLOY_PATH/releases/$RELEASE_ID"
+
+          ssh -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            -p "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "install -d -m 755 '$release_path'"
+
+          scp -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            -P "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" \
+            app.py requirements.txt README.md LICENSE \
+            "$SERVER_USER@$SERVER_HOST:$release_path/"
+
+          scp -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            -P "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" -r \
+            modules data prompts \
+            "$SERVER_USER@$SERVER_HOST:$release_path/"
+
+          ssh -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            -p "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "set -eu; python3 -m venv '$release_path/.venv'; '$release_path/.venv/bin/pip' install --disable-pip-version-check -r '$release_path/requirements.txt'; ln -sfn '$release_path' '$DEPLOY_PATH/current'; sudo -n systemctl restart babel-t.service; sudo -n systemctl is-active --quiet babel-t.service"
+
+      - name: Verify application health
+        shell: bash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..12}; do
+            if ssh -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o ConnectTimeout=10 \
+              -p "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" \
+              "$SERVER_USER@$SERVER_HOST" \
+              "curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8501/_stcore/health"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Babel-T health check failed" >&2
+          exit 1

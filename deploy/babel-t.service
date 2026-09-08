@@ -1,0 +1,21 @@
+[Unit]
+Description=Babel-T Streamlit application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=babelt
+Group=babelt
+WorkingDirectory=/opt/babel-t/current
+EnvironmentFile=-/etc/babel-t/babel-t.env
+ExecStart=/opt/babel-t/current/.venv/bin/streamlit run /opt/babel-t/current/app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
