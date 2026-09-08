@@ -62,6 +62,9 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            -o TCPKeepAlive=yes \
             -p "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" \
             "$SERVER_USER@$SERVER_HOST" \
             "id && test -d '$DEPLOY_PATH/releases' && test -w '$DEPLOY_PATH/releases'"
@@ -82,6 +85,9 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            -o TCPKeepAlive=yes \
             -p "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" \
             "$SERVER_USER@$SERVER_HOST" \
             "install -d -m 755 '$release_path'"
@@ -90,6 +96,9 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            -o TCPKeepAlive=yes \
             -P "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" \
             app.py requirements.txt README.md LICENSE \
             "$SERVER_USER@$SERVER_HOST:$release_path/"
@@ -98,6 +107,9 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            -o TCPKeepAlive=yes \
             -P "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" -r \
             modules data prompts \
             "$SERVER_USER@$SERVER_HOST:$release_path/"
@@ -106,9 +118,12 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            -o TCPKeepAlive=yes \
             -p "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" \
             "$SERVER_USER@$SERVER_HOST" \
-            "set -eu; python3 -m venv '$release_path/.venv'; '$release_path/.venv/bin/pip' install --disable-pip-version-check -r '$release_path/requirements.txt'; ln -sfn '$release_path' '$DEPLOY_PATH/current'; sudo -n systemctl restart babel-t.service; sudo -n systemctl is-active --quiet babel-t.service"
+            "set -eu; python3 -m venv '$release_path/.venv'; '$release_path/.venv/bin/pip' install --disable-pip-version-check --retries 8 --timeout 120 --no-input -r '$release_path/requirements.txt'; ln -sfn '$release_path' '$DEPLOY_PATH/current'; sudo -n systemctl restart babel-t.service; sudo -n systemctl is-active --quiet babel-t.service"
 
       - name: Verify application health
         shell: bash
@@ -123,6 +138,9 @@ jobs:
               -o IdentitiesOnly=yes \
               -o StrictHostKeyChecking=yes \
               -o ConnectTimeout=10 \
+              -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=10 \
+              -o TCPKeepAlive=yes \
               -p "$SERVER_PORT" -i "$HOME/.ssh/deploy_key" \
               "$SERVER_USER@$SERVER_HOST" \
               "curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8501/_stcore/health"; then

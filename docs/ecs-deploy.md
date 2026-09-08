@@ -142,6 +142,14 @@ curl -I http://127.0.0.1:8501/_stcore/health
 
 如果本机健康检查成功、外部仍无法访问，优先检查阿里云安全组 TCP 8501；如果端口可达但页面加载异常，检查 systemd 日志和 Streamlit WebSocket 请求。
 
+如果 Actions 日志在 `Downloading streamlit...` 后出现 `client_loop: send disconnect: Broken pipe`，说明 SSH 会话在远程安装 Python 依赖时断开。工作流已经配置 SSH 保活、pip 重试和 120 秒下载超时；通常直接重新运行该次 workflow 即可。若连续失败，再在 ECS 中检查：
+
+```bash
+free -h
+df -h
+journalctl -u ssh -n 100 --no-pager
+```
+
 ## 未来切换到域名
 
 1. 将 `babel-t.service` 的 `--server.address 0.0.0.0` 改为 `--server.address 127.0.0.1`；
